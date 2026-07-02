@@ -215,6 +215,9 @@ def main():
                     help="model artifacts dir (default: models_v2_final if present, else models_v2)")
     ap.add_argument("--n-mc", type=int, default=200)
     ap.add_argument("--list-players", type=str, default=None)
+    ap.add_argument("--matrix", action="store_true",
+                    help="print the full surface x format probability grid for the pair "
+                         "(Bo3 non-Slam vs Bo5 Slam on Hard/Clay/Grass) instead of a single prediction")
     args = ap.parse_args()
 
     if args.slam and args.best_of != 5:
@@ -243,6 +246,21 @@ def main():
         print(f"Could not resolve player(s): p1={args.p1!r} -> {pid1}, p2={args.p2!r} -> {pid2}. "
               f"Try --list-players to search.", file=sys.stderr)
         sys.exit(1)
+
+    if args.matrix:
+        # Full surface x format grid. Format changes the answer two ways:
+        # (a) best-of-5 lowers outcome variance, amplifying the favorite
+        # (classic longer-series effect), and (b) is_slam carries learned
+        # context beyond match length. Both flags are explicit model inputs.
+        # "Bo5 Slam" is the ATP men's Slam configuration; Carpet omitted
+        # (no tour-level carpet events since 2009).
+        print(f"\n{args.p1} vs {args.p2} — P({args.p1} wins)")
+        print(f"{'Surface':<10} {'Bo3 non-Slam':>14} {'Bo5 Slam':>12}")
+        for surf in ["Hard", "Clay", "Grass"]:
+            r3 = predict_match_prob(pid1, pid2, surf, 3, False, args.data_dir, args.out_dir, n_mc=1)
+            r5 = predict_match_prob(pid1, pid2, surf, 5, True, args.data_dir, args.out_dir, n_mc=1)
+            print(f"{surf:<10} {r3['p1_win_prob']:>14.3f} {r5['p1_win_prob']:>12.3f}")
+        return
 
     result = predict_match_prob(pid1, pid2, args.surface, args.best_of, args.slam,
                                  args.data_dir, args.out_dir, args.n_mc)
