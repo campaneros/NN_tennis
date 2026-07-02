@@ -55,12 +55,123 @@ def elo_only_prob(df: pd.DataFrame) -> np.ndarray:
     return 1.0 / (1.0 + 10.0 ** (-diff / 400.0))
 
 
+def train_final(df, X, feature_cols, y, args):
+    """PRODUCTION refit (--final), two stages:
+
+    Stage 1 (model selection): train on data < 2025-07-01, early-stop on
+      2025-H2 val, fit calibrators there, pick calibration method on the
+      2026 slice. This discovers the ONE hyperparameter that can't be fixed
+      a priori — how many epochs to train — plus the calibration choice,
+      exactly as in the benchmark protocol.
+    Stage 2 (shipped model): retrain from scratch on ALL rows (through the
+      end of the data file) for exactly the epoch count stage 1 found.
+      Standard train-on-all-after-selection refit (Hastie et al., ESL
+      §7.10): the most recent matches — the most informative ones for
+      predicting upcoming matches — DO contribute gradient updates to the
+      shipped weights; nothing is held back from final training.
+
+    Honest-metrics note: reported performance numbers still come ONLY from
+    the benchmark protocol run (train<2022 / blind test >=2024). Stage 1's
+    2025-H2/2026 slices are model-selection tools here, not blind estimates,
+    and stage 2 by construction has no held-out data at all.
+    """
+    tr = df["date"] < 20250701
+    va = (df["date"] >= 20250701) & (df["date"] < 20260101)
+    se = df["date"] >= 20260101
+    print(f"  FINAL refit stage 1 (selection): train={tr.sum():,}  val={va.sum():,}  select={se.sum():,}")
+
+    Xtr, ytr = X[tr].values, y[tr]
+    Xva, yva = X[va].values, y[va]
+    Xse, yse = X[se].values, y[se]
+
+    # Stage-1 preprocessing/vocab fit on its own training window only
+    imputer1 = SimpleImputer(strategy="median").fit(Xtr)
+    scaler1 = StandardScaler().fit(imputer1.transform(Xtr))
+    prep1 = lambda A: scaler1.transform(imputer1.transform(A))
+    vocab1 = build_player_vocab(df[tr])
+    p1_tr, p2_tr = encode_ids(df[tr], vocab1, "p1_id"), encode_ids(df[tr], vocab1, "p2_id")
+    p1_va, p2_va = encode_ids(df[va], vocab1, "p1_id"), encode_ids(df[va], vocab1, "p2_id")
+    p1_se, p2_se = encode_ids(df[se], vocab1, "p1_id"), encode_ids(df[se], vocab1, "p2_id")
+    Xtr_p, Xva_p, Xse_p = prep1(Xtr), prep1(Xva), prep1(Xse)
+
+    net1 = TennisEmbeddingNet(n_players=len(vocab1), num_dim=Xtr_p.shape[1], emb_dim=args.emb_dim)
+    hist1 = train_embedding_net(
+        net1, p1_tr, p2_tr, Xtr_p, ytr.astype(np.float32),
+        p1_va, p2_va, Xva_p, yva.astype(np.float32), device=args.device)
+    best_epoch = int(np.argmin(hist1["val_loss"])) + 1
+    print(f"  stage 1: best epoch by val log-loss = {best_epoch} (of {len(hist1['val_loss'])} run)")
+
+    p_va = embedding_net_predict(net1, p1_va, p2_va, Xva_p, device=args.device)
+    p_se = embedding_net_predict(net1, p1_se, p2_se, Xse_p, device=args.device)
+    iso_nn = IsotonicRegression(out_of_bounds="clip").fit(p_va, yva)
+    platt_nn = platt_fit(p_va, yva)
+    nn_calib_method = choose_calibration(yse, p_se, iso_nn, platt_nn)
+    print(f"  calibration method selected on 2026 slice: {nn_calib_method}")
+    res = [eval_metrics(yse, apply_calibration(m, p_se, iso_nn, platt_nn), m)
+           for m in ["raw", "isotonic", "platt"]]
+    print(pd.DataFrame(res).set_index("model").to_string(float_format=lambda v: f"{v:.4f}"))
+    print("  (2026-slice numbers above are stage-1 diagnostics, NOT a blind benchmark)")
+
+    # ── Stage 2: retrain on EVERYTHING for the discovered epoch count ──────
+    print(f"  FINAL refit stage 2: retraining on all {len(df):,} rows for {best_epoch} epochs...")
+    imputer = SimpleImputer(strategy="median").fit(X.values)
+    scaler = StandardScaler().fit(imputer.transform(X.values))
+    prep = lambda A: scaler.transform(imputer.transform(A))
+    vocab = build_player_vocab(df)
+    print(f"  player vocab size (full data) = {len(vocab):,}")
+    p1_all, p2_all = encode_ids(df, vocab, "p1_id"), encode_ids(df, vocab, "p2_id")
+    Xall_p = prep(X.values)
+
+    net = TennisEmbeddingNet(n_players=len(vocab), num_dim=Xall_p.shape[1], emb_dim=args.emb_dim)
+    nn_history = train_embedding_net(
+        net, p1_all, p2_all, Xall_p, y.astype(np.float32),
+        epochs=best_epoch, device=args.device)
+    nn_history["stage1_val_loss"] = hist1["val_loss"]
+    nn_history["stage1_best_epoch"] = best_epoch
+
+    # Calibrators shipped are the stage-1 ones (fit on genuinely held-out
+    # 2025-H2 predictions). When the selected method is "raw" — the case in
+    # every run so far — they are inert. If a future retrain selects
+    # isotonic/platt, note the mild approximation of applying a
+    # stage-1-fitted calibrator to stage-2 outputs (documented trade-off:
+    # the alternative, calibrating on stage-2 training-set predictions,
+    # would be fit on overconfident in-sample outputs — strictly worse).
+    torch.save(net.state_dict(), os.path.join(args.out_dir, "embedding_nn.pt"))
+    with open(os.path.join(args.out_dir, "player_vocab.json"), "w") as f:
+        json.dump(vocab, f)
+    with open(os.path.join(args.out_dir, "preprocessing.pkl"), "wb") as f:
+        pickle.dump({
+            "imputer": imputer, "scaler": scaler,
+            "iso_nn": iso_nn, "platt_nn": platt_nn,
+            "nn_calib_method": nn_calib_method,
+            "feature_cols": feature_cols,
+            "num_dim": Xall_p.shape[1],
+            "emb_dim": args.emb_dim,
+            "n_players": len(vocab),
+        }, f)
+    with open(os.path.join(args.out_dir, "nn_history.json"), "w") as f:
+        json.dump(nn_history, f, indent=2)
+    with open(os.path.join(args.out_dir, "split_info.json"), "w") as f:
+        json.dump({
+            "mode": "final_production_refit_two_stage",
+            "stage1_train_n": int(tr.sum()), "stage1_val_n": int(va.sum()), "stage1_select_n": int(se.sum()),
+            "stage1_best_epoch": best_epoch,
+            "stage2_train_n": int(len(df)),
+            "note": "stage 2 trains on ALL data for the stage-1-discovered epoch count; "
+                    "no blind test fold — performance estimates come from the benchmark protocol run",
+        }, f, indent=2)
+    print(f"  Saved production artifacts -> {args.out_dir}/")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--data", type=str, default="atp_matches_pretrain.csv")
     ap.add_argument("--out-dir", type=str, default="models_v2")
     ap.add_argument("--device", type=str, default="cpu")
     ap.add_argument("--emb-dim", type=int, default=24)
+    ap.add_argument("--final", action="store_true",
+                    help="production refit on data through 2025-06 (see train_final); "
+                         "use --out-dir models_v2_final to keep benchmark artifacts intact")
     args = ap.parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
 
@@ -70,6 +181,10 @@ def main():
 
     X, feature_cols = engineer_features(df)
     y = df["y"].values.astype(int)
+
+    if args.final:
+        train_final(df, X, feature_cols, y, args)
+        return
 
     tr, va, ca, te = temporal_split(df)
     print(f"  train={tr.sum():,}  val={va.sum():,}  calib={ca.sum():,}  test={te.sum():,}")

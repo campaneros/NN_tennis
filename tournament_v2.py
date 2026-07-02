@@ -136,7 +136,8 @@ def main():
     ap.add_argument("--bracket", type=str, required=True)
     ap.add_argument("--sims", type=int, default=20000)
     ap.add_argument("--data-dir", type=str, default="tennis_atp")
-    ap.add_argument("--out-dir", type=str, default="models_v2")
+    ap.add_argument("--out-dir", type=str, default=None,
+                    help="model artifacts dir (default: models_v2_final if present, else models_v2)")
     ap.add_argument("--out-json", type=str, default=None)
     args = ap.parse_args()
 

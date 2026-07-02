@@ -206,6 +206,7 @@ class PlayerStateTracker:
         self.recent_all: Dict[int, deque] = defaultdict(lambda: deque(maxlen=50))
         self.recent_surf: Dict[Tuple[int, str], deque] = defaultdict(lambda: deque(maxlen=25))
         self.h2h: Dict[Tuple[int, int], int] = defaultdict(int)   # (lo_id, hi_id) -> wins_by_lo_id - wins_by_hi_id
+        self.h2h_surf: Dict[Tuple[int, int, str], int] = defaultdict(int)  # same, but per surface
         self.form_stats: Dict[int, deque] = defaultdict(lambda: deque(maxlen=STAT_WINDOW))
         self.last_known_bio: Dict[int, dict] = {}   # most recent rank/points/age/ht/hand seen for a player
 
@@ -229,6 +230,11 @@ class PlayerStateTracker:
     def h2h_diff(self, pid_a: int, pid_b: int) -> int:
         lo, hi = (pid_a, pid_b) if pid_a < pid_b else (pid_b, pid_a)
         d = self.h2h[(lo, hi)]
+        return d if pid_a == lo else -d
+
+    def h2h_surf_diff(self, pid_a: int, pid_b: int, surface: str) -> int:
+        lo, hi = (pid_a, pid_b) if pid_a < pid_b else (pid_b, pid_a)
+        d = self.h2h_surf[(lo, hi, surface)]
         return d if pid_a == lo else -d
 
     def update(self, w_id: int, l_id: int, surface: str, date: int, tw: float, is_walkover: bool,
@@ -255,6 +261,7 @@ class PlayerStateTracker:
         self.recent_surf[(w_id, surface)].append(1); self.recent_surf[(l_id, surface)].append(0)
         lo, hi = (w_id, l_id) if w_id < l_id else (l_id, w_id)
         self.h2h[(lo, hi)] += 1 if w_id == lo else -1
+        self.h2h_surf[(lo, hi, surface)] += 1 if w_id == lo else -1
 
         if not is_walkover and w_stats is not None and l_stats is not None:
             self.form_stats[w_id].append(w_stats)
@@ -296,6 +303,7 @@ def build_pretrain_table(df: pd.DataFrame, seed: int = 42) -> pd.DataFrame:
         l_hand = m.get("loser_hand", "U")
 
         h2h_diff_w = tracker.h2h_diff(w_id, l_id)
+        h2h_surf_diff_w = tracker.h2h_surf_diff(w_id, l_id, surface)
 
         # ── randomized side assignment: p1/p2 is NOT winner/loser ──────────
         # This makes y the true match outcome, unrecoverable from row
@@ -310,6 +318,7 @@ def build_pretrain_table(df: pd.DataFrame, seed: int = 42) -> pd.DataFrame:
             p1_ht, p2_ht = w_ht, l_ht
             p1_hand, p2_hand = w_hand, l_hand
             h2h_diff_p1 = h2h_diff_w
+            h2h_surf_diff_p1 = h2h_surf_diff_w
             y = 1
         else:
             p1_id, p2_id = l_id, w_id
@@ -320,6 +329,7 @@ def build_pretrain_table(df: pd.DataFrame, seed: int = 42) -> pd.DataFrame:
             p1_ht, p2_ht = l_ht, w_ht
             p1_hand, p2_hand = l_hand, w_hand
             h2h_diff_p1 = -h2h_diff_w
+            h2h_surf_diff_p1 = -h2h_surf_diff_w
             y = 0
 
         row = dict(
@@ -346,6 +356,7 @@ def build_pretrain_table(df: pd.DataFrame, seed: int = 42) -> pd.DataFrame:
             p1_ht=p1_ht, p2_ht=p2_ht,
             p1_hand=p1_hand, p2_hand=p2_hand,
             h2h_diff_p1=h2h_diff_p1,
+            h2h_surf_diff_p1=h2h_surf_diff_p1,
             p1_form_n=snap_p1["stats_n"], p2_form_n=snap_p2["stats_n"],
             y=y,
         )

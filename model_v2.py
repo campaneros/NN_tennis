@@ -50,6 +50,17 @@ def engineer_features(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
     X["elo_surf_diff"] = df["p1_elo_surf"] - df["p2_elo_surf"]
     X["p1_elo"] = df["p1_elo"]; X["p2_elo"] = df["p2_elo"]
 
+    # Surface-Elo shrinkage blend (FiveThirtyEight-style surface weighting):
+    # raw surface Elo is compressed/noisy when a player has few matches on
+    # that surface (grass especially — a handful of events per year), which
+    # makes raw elo_surf_diff systematically understate surface edges there.
+    # Blend toward career Elo with weight w = n/(n+30): 0 surface matches ->
+    # pure career Elo, 30 -> 50/50, 150+ -> mostly surface Elo.
+    w1 = df["p1_matches_surf"] / (df["p1_matches_surf"] + 30.0)
+    w2 = df["p2_matches_surf"] / (df["p2_matches_surf"] + 30.0)
+    X["elo_blend_diff"] = (w1 * df["p1_elo_surf"] + (1 - w1) * df["p1_elo"]) \
+                        - (w2 * df["p2_elo_surf"] + (1 - w2) * df["p2_elo"])
+
     X["rank_points_log_diff"] = np.log1p(df["p1_rank_points"]) - np.log1p(df["p2_rank_points"])
     X["rank_log_diff"] = np.log1p(df["p2_rank"]) - np.log1p(df["p1_rank"])
 
@@ -66,6 +77,12 @@ def engineer_features(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
     X["rest_days_diff"] = (df["p1_rest_days"] - df["p2_rest_days"]).clip(-60, 60)
 
     X["h2h_diff"] = df["h2h_diff_p1"]
+    # Surface-specific H2H: "who wins when THESE TWO meet on THIS surface"
+    # can diverge from both aggregate H2H and surface Elo (e.g. a pair where
+    # one player leads overall but has never beaten the other on grass).
+    # Sparse for most pairs (0 for first meetings) — the models learn how
+    # much to trust it from population-wide data, not from any single pair.
+    X["h2h_surf_diff"] = df["h2h_surf_diff_p1"]
 
     for k in STAT_KEYS:
         X[f"form_{k}_diff"] = df[f"p1_form_{k}"] - df[f"p2_form_{k}"]
@@ -220,9 +237,15 @@ class TennisEmbeddingNet(nn.Module):
 
 
 def train_embedding_net(model: TennisEmbeddingNet, p1_tr, p2_tr, Xtr, ytr,
-                         p1_va, p2_va, Xva, yva, device="cpu",
+                         p1_va=None, p2_va=None, Xva=None, yva=None, device="cpu",
                          epochs=200, patience=15, lr=1e-3, weight_decay=1e-4,
                          batch_size=512, seed=42) -> Dict:
+    """With a validation set: early stopping on val loss (keep best-epoch
+    weights). With p1_va=None: fixed-epoch training on ALL provided data, no
+    early stopping — used by train_v2.train_final stage 2, where the epoch
+    count was already discovered by a stage-1 early-stopped run and we want
+    the freshest matches to contribute gradient updates too (train-on-all
+    after model selection; Hastie et al., ESL §7.10 refit convention)."""
     torch.manual_seed(seed)
     """weight_decay is applied to ALL parameters including the embedding
     table: an L2 penalty on an embedding row is equivalent (MAP estimation)
@@ -235,7 +258,9 @@ def train_embedding_net(model: TennisEmbeddingNet, p1_tr, p2_tr, Xtr, ytr,
     collaborative filtering (Koren, Bell & Volinsky, 2009)."""
     to_t = lambda a, dt: torch.tensor(a, dtype=dt, device=device)
     p1_tr_t, p2_tr_t, Xtr_t, ytr_t = to_t(p1_tr, torch.long), to_t(p2_tr, torch.long), to_t(Xtr, torch.float32), to_t(ytr, torch.float32)
-    p1_va_t, p2_va_t, Xva_t, yva_t = to_t(p1_va, torch.long), to_t(p2_va, torch.long), to_t(Xva, torch.float32), to_t(yva, torch.float32)
+    has_val = p1_va is not None
+    if has_val:
+        p1_va_t, p2_va_t, Xva_t, yva_t = to_t(p1_va, torch.long), to_t(p2_va, torch.long), to_t(Xva, torch.float32), to_t(yva, torch.float32)
 
     model = model.to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
@@ -258,10 +283,13 @@ def train_embedding_net(model: TennisEmbeddingNet, p1_tr, p2_tr, Xtr, ytr,
             total += loss.item() * len(idx)
         train_loss = total / n
 
+        history["train_loss"].append(train_loss)
+        if not has_val:
+            continue
+
         model.eval()
         with torch.no_grad():
             val_loss = crit(model(p1_va_t, p2_va_t, Xva_t), yva_t).item()
-        history["train_loss"].append(train_loss)
         history["val_loss"].append(val_loss)
 
         if val_loss < best_loss - 1e-5:
@@ -271,7 +299,8 @@ def train_embedding_net(model: TennisEmbeddingNet, p1_tr, p2_tr, Xtr, ytr,
             if bad_epochs >= patience:
                 break
 
-    model.load_state_dict(best_state)
+    if has_val:
+        model.load_state_dict(best_state)
     model.eval()
     return history
 

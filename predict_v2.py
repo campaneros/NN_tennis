@@ -28,6 +28,7 @@ Usage:
 """
 import argparse
 import glob
+import os
 import pickle
 import sys
 import unicodedata
@@ -44,6 +45,24 @@ from model_v2 import (
 )
 
 _CACHE: Dict[str, object] = {}
+
+
+def resolve_out_dir(out_dir: Optional[str]) -> str:
+    """Prefer the production refit (models_v2_final, trained through 2025 —
+    see train_v2.train_final) over the benchmark artifacts (models_v2,
+    trained only on pre-2022 data for honest out-of-time evaluation; its
+    player embeddings are frozen at each player's pre-2022 self and should
+    not be used for real predictions)."""
+    if out_dir:
+        return out_dir
+    chosen = "models_v2_final" if os.path.isdir("models_v2_final") else "models_v2"
+    print(f"Using model artifacts from {chosen}/", file=sys.stderr)
+    if chosen == "models_v2":
+        print("WARNING: models_v2_final/ not found — falling back to the BENCHMARK "
+              "model (training window ends 2022; stale player embeddings). Run "
+              "`train_v2.py --final --out-dir models_v2_final` for production use.",
+              file=sys.stderr)
+    return chosen
 
 
 def _norm_name(s: str) -> str:
@@ -79,7 +98,7 @@ def resolve_player(name: str, name_index: Dict[str, int]) -> Optional[int]:
     return None
 
 
-def load_state(data_dir: str, out_dir: str):
+def load_state(data_dir: str, out_dir: Optional[str] = None):
     """Replay full history once (walk-forward) to get each player's CURRENT
     state, and load the trained model artifacts. Cached in-process so a
     tournament simulation (tournament_v2.py) calling this repeatedly for
@@ -87,6 +106,7 @@ def load_state(data_dir: str, out_dir: str):
     if "tracker" in _CACHE:
         return _CACHE
 
+    out_dir = resolve_out_dir(out_dir)
     print("Replaying full match history to build current player state (one-time)...", file=sys.stderr)
     df_raw = load_raw_atp(data_dir)
     _, tracker = build_pretrain_table(df_raw)
@@ -112,6 +132,7 @@ def build_match_row(pid1: int, pid2: int, surface: str, best_of: int, is_slam: b
     snap2 = tracker.snapshot(pid2, surface, state["last_date"])
     bio1, bio2 = tracker.bio(pid1), tracker.bio(pid2)
     h2h = tracker.h2h_diff(pid1, pid2)
+    h2h_surf = tracker.h2h_surf_diff(pid1, pid2, surface)
 
     row = dict(
         date=state["last_date"], surface=surface, best_of=best_of,
@@ -130,6 +151,7 @@ def build_match_row(pid1: int, pid2: int, surface: str, best_of: int, is_slam: b
         p1_ht=bio1["ht"], p2_ht=bio2["ht"],
         p1_hand=bio1["hand"], p2_hand=bio2["hand"],
         h2h_diff_p1=h2h,
+        h2h_surf_diff_p1=h2h_surf,
     )
     for k in ["1st_in_pct", "1st_won_pct", "2nd_won_pct", "ace_rate", "df_rate",
               "bp_saved_pct", "sv_pts_won_pct", "ret_pts_won_pct"]:
@@ -139,7 +161,7 @@ def build_match_row(pid1: int, pid2: int, surface: str, best_of: int, is_slam: b
 
 
 def predict_match_prob(pid1: int, pid2: int, surface: str, best_of: int, is_slam: bool,
-                        data_dir: str = "tennis_atp", out_dir: str = "models_v2",
+                        data_dir: str = "tennis_atp", out_dir: Optional[str] = None,
                         n_mc: int = 200) -> Dict:
     state = load_state(data_dir, out_dir)
     row = build_match_row(pid1, pid2, surface, best_of, is_slam, state)
@@ -157,19 +179,17 @@ def predict_match_prob(pid1: int, pid2: int, surface: str, best_of: int, is_slam
     # an already well-calibrated raw probability on a small calib fold).
     calib_fn = lambda p: apply_calibration(prep_art["nn_calib_method"], p, prep_art["iso_nn"], prep_art["platt_nn"])
 
+    # Point estimate is ALWAYS the deterministic forward pass (dropout off):
+    # repeat runs of the same query must return the same probability, and
+    # this is also what the model was calibrated/evaluated with. MC-dropout
+    # (Gal & Ghahramani, 2016) is used ONLY for the uncertainty interval.
+    raw = embedding_net_predict(state["net"], p1_idx, p2_idx, Xp)
+    p_point = float(calib_fn(raw)[0])
     if n_mc <= 1:
-        # Deterministic path (dropout off): used by tournament_v2.py to build
-        # a stable, reproducible pairwise probability matrix — a fresh noisy
-        # MC sample per pair would make Monte Carlo bracket simulation
-        # results non-reproducible run-to-run for a REASON unrelated to the
-        # bracket randomness itself.
-        raw = embedding_net_predict(state["net"], p1_idx, p2_idx, Xp)
-        p_point = float(calib_fn(raw)[0])
         lo = hi = p_point
     else:
-        mean_raw, samples = embedding_net_mc_predict(state["net"], p1_idx, p2_idx, Xp, n_samples=n_mc)
+        _, samples = embedding_net_mc_predict(state["net"], p1_idx, p2_idx, Xp, n_samples=n_mc)
         p_cal_samples = calib_fn(samples.reshape(-1)).reshape(samples.shape)
-        p_point = float(calib_fn(mean_raw)[0])
         lo, hi = np.percentile(p_cal_samples[:, 0], [10, 90])
 
     return dict(
@@ -191,7 +211,8 @@ def main():
     ap.add_argument("--best-of", type=int, default=3, choices=[3, 5])
     ap.add_argument("--slam", action="store_true")
     ap.add_argument("--data-dir", type=str, default="tennis_atp")
-    ap.add_argument("--out-dir", type=str, default="models_v2")
+    ap.add_argument("--out-dir", type=str, default=None,
+                    help="model artifacts dir (default: models_v2_final if present, else models_v2)")
     ap.add_argument("--n-mc", type=int, default=200)
     ap.add_argument("--list-players", type=str, default=None)
     args = ap.parse_args()
