@@ -1,0 +1,203 @@
+#!/usr/bin/env python3
+"""
+tournament_v2.py — Pre-tournament bracket simulation
+=========================================================================
+Takes a tournament bracket (players in initial-round slot order, i.e. the
+standard single-elimination seeding order) and Monte-Carlo simulates the
+whole draw using the SAME calibrated pre-match model as predict_v2.py, to
+estimate, for every player:
+  - probability of reaching each round,
+  - probability of winning the title.
+
+Round-by-round update (no future leakage):
+  Pass --results-so-far with the ACTUAL winners of already-completed
+  rounds. Those rounds are then treated as fixed/observed (probability
+  1.0 for the real winner) instead of simulated, and only the remaining,
+  not-yet-played rounds are drawn stochastically. This is the correct way
+  to "update after each phase": nothing about future rounds is used to
+  decide who advanced in past rounds, and the simulation for the
+  unresolved part of the draw is unconditional on anything not yet known.
+
+Why Monte Carlo (rather than closed-form round-probability recursion):
+  A player's probability of REACHING round k depends on who they are
+  paired against, which itself depends on the outcomes of the OTHER
+  half's earlier matches. This is a probabilistic dependency structure
+  (see MODEL_V2_REPORT.md sect. 4.6) most cleanly evaluated by sampling
+  complete draws end-to-end (standard approach in bracket forecasting,
+  e.g. FiveThirtyEight's tennis Elo tournament forecasts) rather than by
+  a per-round independence approximation, which would ignore the
+  opponent-identity dependency across rounds and bias title probabilities
+  for top seeds downward (their round-2 opponent's strength is not drawn
+  independently of round-1 results elsewhere in the bracket).
+
+Bracket JSON schema:
+{
+  "surface": "Hard", "best_of": 5, "is_slam": true,
+  "players": ["Carlos Alcaraz", "Jannik Sinner", "Novak Djokovic", ...],
+  "results_so_far": [["Carlos Alcaraz", "Novak Djokovic", ...]]   // optional,
+     // one list of winners per COMPLETED round, in bracket order; omit or
+     // leave empty for a pre-tournament (round-0) forecast.
+}
+`players` length must be a power of 2 (byes should be modeled as an
+explicit "BYE" placeholder player that always loses, or by pre-filling
+round 1 into results_so_far).
+
+Usage:
+  python tournament_v2.py --bracket wimbledon_2026.json --sims 20000
+"""
+import argparse
+import json
+import sys
+from collections import defaultdict
+from typing import Dict, List, Optional
+
+import numpy as np
+
+from predict_v2 import build_name_index, load_state, predict_match_prob, resolve_player
+
+
+def _next_pow2_check(n: int):
+    if n & (n - 1) != 0 or n < 2:
+        raise ValueError(f"players list length must be a power of 2 (got {n}). "
+                          f"Model byes as an explicit 'BYE' player or pre-fill round 1 "
+                          f"in results_so_far.")
+
+
+def match_prob_matrix(players: List[str], pids: List[int], surface: str, best_of: int,
+                       is_slam: bool, data_dir: str, out_dir: str) -> Dict:
+    """Pre-compute P(i beats j) for every pair once (players x players), so
+    the Monte-Carlo loop below only does O(1) probability lookups per
+    simulated match instead of re-scoring the model for every trial."""
+    n = len(players)
+    P = np.full((n, n), np.nan)
+    for i in range(n):
+        for j in range(n):
+            if i == j or not np.isnan(P[i, j]):
+                continue
+            r = predict_match_prob(pids[i], pids[j], surface, best_of, is_slam,
+                                    data_dir, out_dir, n_mc=1)
+            P[i, j] = r["p1_win_prob"]
+            P[j, i] = 1.0 - r["p1_win_prob"]
+    return P
+
+
+def simulate(players: List[str], P: np.ndarray, results_so_far: Optional[List[List[str]]],
+             n_sims: int, seed: int = 42) -> Dict:
+    n = len(players)
+    n_rounds = int(np.log2(n))
+    name_to_idx = {p: i for i, p in enumerate(players)}
+    results_so_far = results_so_far or []
+
+    reach_counts = np.zeros((n, n_rounds + 1), dtype=np.int64)  # reach_counts[i, r] = reached round r (0=round1 entrant)
+    title_counts = np.zeros(n, dtype=np.int64)
+    rng = np.random.default_rng(seed)
+
+    for _ in range(n_sims):
+        alive = list(range(n))  # current round's participants, in bracket order
+        for i in alive:
+            reach_counts[i, 0] += 1
+        for rnd in range(n_rounds):
+            fixed_round = results_so_far[rnd] if rnd < len(results_so_far) else None
+            winners = []
+            for m in range(len(alive) // 2):
+                a, b = alive[2 * m], alive[2 * m + 1]
+                if fixed_round is not None:
+                    w_name = fixed_round[m]
+                    w = name_to_idx[w_name] if w_name in name_to_idx else (a if players[a] == w_name else b)
+                else:
+                    p_a = P[a, b]
+                    w = a if rng.random() < p_a else b
+                winners.append(w)
+            alive = winners
+            for i in alive:
+                reach_counts[i, rnd + 1] += 1
+        title_counts[alive[0]] += 1
+
+    reach_prob = reach_counts / n_sims
+    title_prob = title_counts / n_sims
+    return dict(reach_prob=reach_prob, title_prob=title_prob, n_rounds=n_rounds)
+
+
+ROUND_NAMES = {0: "Entered", 1: "R1 won", 2: "R2 won", 3: "R3 won", 4: "R4 won",
+               5: "QF won", 6: "SF won", 7: "F won (champion)"}
+
+
+def round_name(n_rounds: int, r: int) -> str:
+    # map generically for any draw size: last round label = champion
+    if r == n_rounds:
+        return "CHAMPION"
+    if r == 0:
+        return "Round-1 entrant"
+    return f"Reached round {r + 1}"
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--bracket", type=str, required=True)
+    ap.add_argument("--sims", type=int, default=20000)
+    ap.add_argument("--data-dir", type=str, default="tennis_atp")
+    ap.add_argument("--out-dir", type=str, default="models_v2")
+    ap.add_argument("--out-json", type=str, default=None)
+    args = ap.parse_args()
+
+    with open(args.bracket) as f:
+        cfg = json.load(f)
+
+    players = cfg["players"]
+    _next_pow2_check(len(players))
+    surface = cfg.get("surface", "Hard")
+    best_of = int(cfg.get("best_of", 3))
+    is_slam = bool(cfg.get("is_slam", False))
+    results_so_far = cfg.get("results_so_far", [])
+
+    print(f"Bracket: {len(players)} players | surface={surface} best_of={best_of} is_slam={is_slam} "
+          f"| {len(results_so_far)} round(s) already fixed", file=sys.stderr)
+
+    state = load_state(args.data_dir, args.out_dir)
+    pids = []
+    for p in players:
+        pid = resolve_player(p, state["name_index"])
+        if pid is None:
+            print(f"Could not resolve player '{p}' — check spelling / use predict_v2.py --list-players", file=sys.stderr)
+            sys.exit(1)
+        pids.append(pid)
+
+    print("Scoring all pairwise matchups with the calibrated model...", file=sys.stderr)
+    P = match_prob_matrix(players, pids, surface, best_of, is_slam, args.data_dir, args.out_dir)
+
+    print(f"Running {args.sims:,} Monte Carlo tournament simulations...", file=sys.stderr)
+    sim = simulate(players, P, results_so_far, args.sims)
+
+    n_rounds = sim["n_rounds"]
+    order = np.argsort(-sim["title_prob"])
+    print(f"\n{'Player':<28} " + " ".join(f"{round_name(n_rounds, r):>16}" for r in range(1, n_rounds + 1)))
+    for i in order:
+        row = " ".join(f"{sim['reach_prob'][i, r]:16.3f}" for r in range(1, n_rounds + 1))
+        print(f"{players[i]:<28} {row}")
+
+    print(f"\nTitle probabilities (sorted):")
+    for i in order:
+        if sim["title_prob"][i] > 0 or True:
+            print(f"  {players[i]:<28} {sim['title_prob'][i]:.4f}")
+
+    if args.out_json:
+        out = {
+            "surface": surface, "best_of": best_of, "is_slam": is_slam,
+            "n_sims": args.sims,
+            "players": [
+                {
+                    "name": players[i],
+                    "title_prob": float(sim["title_prob"][i]),
+                    "round_reach_prob": {round_name(n_rounds, r): float(sim["reach_prob"][i, r])
+                                          for r in range(1, n_rounds + 1)},
+                }
+                for i in order
+            ],
+        }
+        with open(args.out_json, "w") as f:
+            json.dump(out, f, indent=2)
+        print(f"\nSaved -> {args.out_json}")
+
+
+if __name__ == "__main__":
+    main()
