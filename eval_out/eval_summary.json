@@ -1,0 +1,86 @@
+{
+  "n_matches": 6162,
+  "surfaces": [
+    "Hard",
+    "Clay",
+    "Grass",
+    "Carpet"
+  ],
+  "alpha_nn": 0.25,
+  "k_scale": 0.4,
+  "metrics": {
+    "stat_elo": {
+      "accuracy": 0.6306,
+      "brier": 0.232,
+      "log_loss": 0.6564,
+      "ece": 0.0682,
+      "roc_auc": 0.6755,
+      "n": 6162
+    },
+    "blended": {
+      "accuracy": 0.6306,
+      "brier": 0.232,
+      "log_loss": 0.6564,
+      "ece": 0.0682,
+      "roc_auc": 0.6755,
+      "n": 6162
+    }
+  },
+  "stat_weights": {
+    "Clay": [
+      0.18,
+      0.16,
+      0.16,
+      0.14,
+      0.1,
+      0.08,
+      0.1,
+      0.04,
+      0.04
+    ],
+    "Hard": [
+      0.22,
+      0.14,
+      0.14,
+      0.12,
+      0.1,
+      0.1,
+      0.1,
+      0.04,
+      0.04
+    ],
+    "Grass": [
+      0.25,
+      0.12,
+      0.12,
+      0.1,
+      0.1,
+      0.14,
+      0.1,
+      0.04,
+      0.03
+    ],
+    "Carpet": [
+      0.23,
+      0.13,
+      0.13,
+      0.11,
+      0.1,
+      0.12,
+      0.1,
+      0.04,
+      0.04
+    ]
+  },
+  "stat_cols": [
+    "1st_won_pct",
+    "bp_save_pct",
+    "ret_pts_pct",
+    "pressure_win_pct",
+    "2nd_won_pct",
+    "winners_rate",
+    "uf_rate",
+    "df_rate",
+    "forced_err_rate"
+  ]
+}
