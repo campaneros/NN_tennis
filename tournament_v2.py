@@ -63,27 +63,57 @@ def _next_pow2_check(n: int):
                           f"in results_so_far.")
 
 
-def match_prob_matrix(players: List[str], pids: List[int], surface: str, best_of: int,
-                       is_slam: bool, data_dir: str, out_dir: str) -> Dict:
-    """Pre-compute P(i beats j) for every pair once (players x players), so
-    the Monte-Carlo loop below only does O(1) probability lookups per
-    simulated match instead of re-scoring the model for every trial."""
+def match_prob_matrix(players: List[str], pids: List[Optional[int]], surface: str, best_of: int,
+                       is_slam: bool, data_dir: str, out_dir: str, n_mc_model: int = 30) -> Dict:
+    """Pre-compute, for every pair, both a point estimate P[i,j] (for
+    display) and `n_mc_model` MC-dropout draws P_samples[i,j,:] of P(i
+    beats j) (Gal & Ghahramani, 2016 — same mechanism predict_v2.py uses
+    for its single-match confidence interval), so the Monte-Carlo bracket
+    loop below can draw a fresh, differently-uncertain matchup probability
+    on every simulated trial instead of reusing one fixed number for all
+    20,000 draws. This is what makes the tournament's reach/title
+    probabilities carry an error bar that reflects genuine MODEL
+    uncertainty, not just bracket-structure sampling noise: two players
+    with identical point-estimate matchup probabilities but very different
+    confidence should NOT produce equally sharp tournament forecasts.
+
+    Players with pid=None (not found in the ATP dataset — no history to
+    score them on) are treated as an automatic loss against any resolvable
+    opponent, so the rest of the bracket's probabilities are computed AS IF
+    that player weren't a threat, rather than crashing the whole run. Two
+    unresolvable players facing each other (only possible pre-tournament,
+    since results_so_far already fixes real winners for completed rounds)
+    falls back to a 50/50 coin flip."""
     n = len(players)
     P = np.full((n, n), np.nan)
+    P_samples = np.full((n, n, n_mc_model), np.nan)
     for i in range(n):
         for j in range(n):
             if i == j or not np.isnan(P[i, j]):
                 continue
+            if pids[i] is None or pids[j] is None:
+                if pids[i] is None and pids[j] is None:
+                    pij = 0.5
+                elif pids[i] is None:
+                    pij = 0.0
+                else:
+                    pij = 1.0
+                P[i, j], P[j, i] = pij, 1.0 - pij
+                P_samples[i, j, :], P_samples[j, i, :] = pij, 1.0 - pij
+                continue
             r = predict_match_prob(pids[i], pids[j], surface, best_of, is_slam,
-                                    data_dir, out_dir, n_mc=1)
+                                    data_dir, out_dir, n_mc=n_mc_model)
             P[i, j] = r["p1_win_prob"]
             P[j, i] = 1.0 - r["p1_win_prob"]
-    return P
+            P_samples[i, j, :] = r["p1_win_samples"]
+            P_samples[j, i, :] = 1.0 - r["p1_win_samples"]
+    return dict(P=P, P_samples=P_samples)
 
 
-def simulate(players: List[str], P: np.ndarray, results_so_far: Optional[List[List[str]]],
+def simulate(players: List[str], P_samples: np.ndarray, results_so_far: Optional[List[List[str]]],
              n_sims: int, seed: int = 42) -> Dict:
     n = len(players)
+    n_mc_model = P_samples.shape[2]
     n_rounds = int(np.log2(n))
     name_to_idx = {p: i for i, p in enumerate(players)}
     results_so_far = results_so_far or []
@@ -105,7 +135,12 @@ def simulate(players: List[str], P: np.ndarray, results_so_far: Optional[List[Li
                     w_name = fixed_round[m]
                     w = name_to_idx[w_name] if w_name in name_to_idx else (a if players[a] == w_name else b)
                 else:
-                    p_a = P[a, b]
+                    # Draw a fresh MC-dropout sample of P(a beats b) for THIS
+                    # trial (rather than reusing one fixed number every
+                    # time) — this is what propagates model epistemic
+                    # uncertainty into the final title/reach probabilities,
+                    # on top of the bracket's own structural randomness.
+                    p_a = P_samples[a, b, rng.integers(n_mc_model)]
                     w = a if rng.random() < p_a else b
                 winners.append(w)
             alive = winners
@@ -115,7 +150,18 @@ def simulate(players: List[str], P: np.ndarray, results_so_far: Optional[List[Li
 
     reach_prob = reach_counts / n_sims
     title_prob = title_counts / n_sims
-    return dict(reach_prob=reach_prob, title_prob=title_prob, n_rounds=n_rounds)
+    # Each of the n_sims trials independently redraws BOTH the bracket
+    # structure and the per-match model-uncertainty sample, so the trials
+    # are i.i.d. Bernoulli(reach_prob) — a standard normal-approximation
+    # binomial standard error is therefore a valid 90% CI (z=1.645), and it
+    # is wider than pure sampling noise alone precisely because it also
+    # carries the model's own uncertainty about each matchup.
+    se = np.sqrt(np.clip(reach_prob * (1 - reach_prob), 0, None) / n_sims)
+    reach_ci90 = np.clip(reach_prob[:, :, None] + np.array([-1.645, 1.645]) * se[:, :, None], 0.0, 1.0)
+    title_se = np.sqrt(np.clip(title_prob * (1 - title_prob), 0, None) / n_sims)
+    title_ci90 = np.clip(np.stack([title_prob - 1.645 * title_se, title_prob + 1.645 * title_se], axis=1), 0.0, 1.0)
+    return dict(reach_prob=reach_prob, reach_ci90=reach_ci90, title_prob=title_prob,
+                title_ci90=title_ci90, n_rounds=n_rounds)
 
 
 ROUND_NAMES = {0: "Entered", 1: "R1 won", 2: "R2 won", 3: "R3 won", 4: "R4 won",
@@ -135,6 +181,9 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--bracket", type=str, required=True)
     ap.add_argument("--sims", type=int, default=20000)
+    ap.add_argument("--n-mc-model", type=int, default=30,
+                    help="MC-dropout samples per pairwise matchup, used to propagate model "
+                         "uncertainty into the tournament's reach/title probability error bars")
     ap.add_argument("--data-dir", type=str, default="tennis_atp")
     ap.add_argument("--out-dir", type=str, default=None,
                     help="model artifacts dir (default: models_v2_final if present, else models_v2)")
@@ -155,42 +204,61 @@ def main():
           f"| {len(results_so_far)} round(s) already fixed", file=sys.stderr)
 
     state = load_state(args.data_dir, args.out_dir)
-    pids = []
+    pids: List[Optional[int]] = []
+    n_unresolved = 0
     for p in players:
         pid = resolve_player(p, state["name_index"])
         if pid is None:
-            print(f"Could not resolve player '{p}' — check spelling / use predict_v2.py --list-players", file=sys.stderr)
-            sys.exit(1)
+            n_unresolved += 1
+            print(f"WARNING: could not resolve player '{p}' (no ATP tour-level history in the "
+                  f"dataset) — check spelling with predict_v2.py --list-players. Treating as an "
+                  f"automatic loss against any resolved opponent; probabilities for the rest of "
+                  f"the bracket are computed without this player.", file=sys.stderr)
         pids.append(pid)
 
-    print("Scoring all pairwise matchups with the calibrated model...", file=sys.stderr)
-    P = match_prob_matrix(players, pids, surface, best_of, is_slam, args.data_dir, args.out_dir)
+    if n_unresolved:
+        print(f"\n{n_unresolved} of {len(players)} player(s) unresolved — excluded from win-probability "
+              f"scoring as described above.\n", file=sys.stderr)
+
+    print("Scoring all pairwise matchups with the calibrated model "
+          f"({args.n_mc_model} MC-dropout samples/pair)...", file=sys.stderr)
+    mat = match_prob_matrix(players, pids, surface, best_of, is_slam, args.data_dir, args.out_dir,
+                             n_mc_model=args.n_mc_model)
 
     print(f"Running {args.sims:,} Monte Carlo tournament simulations...", file=sys.stderr)
-    sim = simulate(players, P, results_so_far, args.sims)
+    sim = simulate(players, mat["P_samples"], results_so_far, args.sims)
 
     n_rounds = sim["n_rounds"]
     order = np.argsort(-sim["title_prob"])
-    print(f"\n{'Player':<28} " + " ".join(f"{round_name(n_rounds, r):>16}" for r in range(1, n_rounds + 1)))
+    print(f"\nReach probabilities (90% CI in brackets; CI reflects both bracket-draw randomness "
+          f"AND the model's own MC-dropout uncertainty about each matchup):")
+    print(f"{'Player':<28} " + " ".join(f"{round_name(n_rounds, r):>26}" for r in range(1, n_rounds + 1)))
     for i in order:
-        row = " ".join(f"{sim['reach_prob'][i, r]:16.3f}" for r in range(1, n_rounds + 1))
+        row = " ".join(
+            f"{sim['reach_prob'][i, r]:6.3f} [{sim['reach_ci90'][i, r, 0]:.3f}-{sim['reach_ci90'][i, r, 1]:.3f}]"
+            for r in range(1, n_rounds + 1)
+        )
         print(f"{players[i]:<28} {row}")
 
-    print(f"\nTitle probabilities (sorted):")
+    print(f"\nTitle probabilities (sorted, 90% CI in brackets):")
     for i in order:
-        if sim["title_prob"][i] > 0 or True:
-            print(f"  {players[i]:<28} {sim['title_prob'][i]:.4f}")
+        lo, hi = sim["title_ci90"][i]
+        print(f"  {players[i]:<28} {sim['title_prob'][i]:.4f}  [{lo:.4f}-{hi:.4f}]")
 
     if args.out_json:
         out = {
             "surface": surface, "best_of": best_of, "is_slam": is_slam,
-            "n_sims": args.sims,
+            "n_sims": args.sims, "n_mc_model": args.n_mc_model,
             "players": [
                 {
                     "name": players[i],
                     "title_prob": float(sim["title_prob"][i]),
+                    "title_ci90": [float(sim["title_ci90"][i, 0]), float(sim["title_ci90"][i, 1])],
                     "round_reach_prob": {round_name(n_rounds, r): float(sim["reach_prob"][i, r])
                                           for r in range(1, n_rounds + 1)},
+                    "round_reach_ci90": {round_name(n_rounds, r): [float(sim["reach_ci90"][i, r, 0]),
+                                                                    float(sim["reach_ci90"][i, r, 1])]
+                                         for r in range(1, n_rounds + 1)},
                 }
                 for i in order
             ],

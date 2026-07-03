@@ -187,20 +187,75 @@ def predict_match_prob(pid1: int, pid2: int, surface: str, best_of: int, is_slam
     p_point = float(calib_fn(raw)[0])
     if n_mc <= 1:
         lo = hi = p_point
+        p1_win_samples = np.array([p_point])
     else:
         _, samples = embedding_net_mc_predict(state["net"], p1_idx, p2_idx, Xp, n_samples=n_mc)
         p_cal_samples = calib_fn(samples.reshape(-1)).reshape(samples.shape)
-        lo, hi = np.percentile(p_cal_samples[:, 0], [10, 90])
+        p1_win_samples = p_cal_samples[:, 0]
+        lo, hi = np.percentile(p1_win_samples, [10, 90])
 
     return dict(
         p1_win_prob=p_point,
         p2_win_prob=1.0 - p_point,
         p1_win_ci90=(float(lo), float(hi)),
+        p1_win_samples=p1_win_samples,  # calibrated MC-dropout draws — reused by tournament_v2.py
         p1_oov=bool(p1_idx[0] == 0),
         p2_oov=bool(p2_idx[0] == 0),
         p1_elo=float(row["p1_elo"].iloc[0]), p2_elo=float(row["p2_elo"].iloc[0]),
         p1_elo_surf=float(row["p1_elo_surf"].iloc[0]), p2_elo_surf=float(row["p2_elo_surf"].iloc[0]),
     )
+
+
+def value_bet_analysis(label: str, model_p: float, ci90: "tuple[float, float]", decimal_odds: float) -> str:
+    """Compares the model's probability (and its 90% MC-dropout interval)
+    against a bookmaker's decimal odds, and states whether the edge is
+    robust enough to act on.
+
+    Kelly criterion (Kelly, 1956; standard in sports-betting bankroll
+    management): for decimal odds `o` and true win probability `p`, the
+    growth-optimal stake fraction of bankroll is
+        f* = (p*o - 1) / (o - 1)
+    We report a QUARTER-Kelly stake (f*/4) rather than full Kelly — a
+    standard practitioner haircut (Thorp) because f* assumes `p` is known
+    exactly, whereas here it's a model estimate with its own uncertainty
+    (the 90% CI); betting full Kelly on an uncertain edge risks large
+    drawdowns if the model is optimistic.
+
+    The recommendation itself uses the CI, not just the point estimate:
+    - VALUE BET: even the pessimistic (CI lower-bound) probability still
+      implies positive expected value at these odds — the edge survives
+      the model's own uncertainty about itself.
+    - MARGINAL: the point estimate has positive edge, but the CI lower
+      bound does not — a less confident, discretionary edge.
+    - NO BET: the point estimate itself is below the break-even (implied)
+      probability — negative expected value even optimistically.
+    """
+    implied_p = 1.0 / decimal_odds
+    edge = model_p - implied_p
+    ev_per_unit = model_p * decimal_odds - 1.0
+    lo, hi = ci90
+    kelly_full = max(0.0, (model_p * decimal_odds - 1.0) / (decimal_odds - 1.0))
+    kelly_quarter = kelly_full / 4.0
+
+    lines = [
+        f"\n  --- Value bet check: {label} @ decimal odds {decimal_odds:.2f} ---",
+        f"  Implied probability (market):  {implied_p:.3f}",
+        f"  Model probability (point):     {model_p:.3f}   (90% CI: {lo:.3f}-{hi:.3f})",
+        f"  Edge (model - implied):        {edge:+.3f}",
+        f"  Expected value per 1 staked:   {ev_per_unit:+.3f}",
+    ]
+    if lo > implied_p:
+        lines.append(f"  => VALUE BET: edge holds even at the pessimistic end of the CI. "
+                      f"Suggested stake: {kelly_quarter:.1%} of bankroll (quarter-Kelly; "
+                      f"full Kelly would be {kelly_full:.1%}).")
+    elif model_p > implied_p:
+        lines.append(f"  => MARGINAL: positive edge at the point estimate, but the CI lower "
+                      f"bound ({lo:.3f}) falls below the implied probability — the edge is not "
+                      f"robust to the model's own uncertainty. Bet small or skip.")
+    else:
+        lines.append(f"  => NO BET: model probability does not beat the market's implied "
+                      f"probability — negative expected value.")
+    return "\n".join(lines)
 
 
 def main():
@@ -218,6 +273,10 @@ def main():
     ap.add_argument("--matrix", action="store_true",
                     help="print the full surface x format probability grid for the pair "
                          "(Bo3 non-Slam vs Bo5 Slam on Hard/Clay/Grass) instead of a single prediction")
+    ap.add_argument("--odds-p1", type=float, default=None,
+                    help="bookmaker decimal odds on --p1 to win (e.g. 2.10) — prints a value-bet check")
+    ap.add_argument("--odds-p2", type=float, default=None,
+                    help="bookmaker decimal odds on --p2 to win — prints a value-bet check")
     args = ap.parse_args()
 
     if args.slam and args.best_of != 5:
@@ -254,12 +313,14 @@ def main():
         # context beyond match length. Both flags are explicit model inputs.
         # "Bo5 Slam" is the ATP men's Slam configuration; Carpet omitted
         # (no tour-level carpet events since 2009).
-        print(f"\n{args.p1} vs {args.p2} — P({args.p1} wins)")
-        print(f"{'Surface':<10} {'Bo3 non-Slam':>14} {'Bo5 Slam':>12}")
+        print(f"\n{args.p1} vs {args.p2} — P({args.p1} wins)  (90% MC-dropout interval in brackets)")
+        print(f"{'Surface':<10} {'Bo3 non-Slam':>24} {'Bo5 Slam':>24}")
         for surf in ["Hard", "Clay", "Grass"]:
-            r3 = predict_match_prob(pid1, pid2, surf, 3, False, args.data_dir, args.out_dir, n_mc=1)
-            r5 = predict_match_prob(pid1, pid2, surf, 5, True, args.data_dir, args.out_dir, n_mc=1)
-            print(f"{surf:<10} {r3['p1_win_prob']:>14.3f} {r5['p1_win_prob']:>12.3f}")
+            r3 = predict_match_prob(pid1, pid2, surf, 3, False, args.data_dir, args.out_dir, n_mc=args.n_mc)
+            r5 = predict_match_prob(pid1, pid2, surf, 5, True, args.data_dir, args.out_dir, n_mc=args.n_mc)
+            c3, c5 = r3["p1_win_ci90"], r5["p1_win_ci90"]
+            print(f"{surf:<10} {r3['p1_win_prob']:>8.3f} [{c3[0]:.3f}-{c3[1]:.3f}] "
+                  f"{r5['p1_win_prob']:>8.3f} [{c5[0]:.3f}-{c5[1]:.3f}]")
         return
 
     result = predict_match_prob(pid1, pid2, args.surface, args.best_of, args.slam,
@@ -276,6 +337,12 @@ def main():
     print(f"\n  P({args.p1} wins) = {result['p1_win_prob']:.3f}  "
           f"(90% MC-dropout interval: {result['p1_win_ci90'][0]:.3f}-{result['p1_win_ci90'][1]:.3f})")
     print(f"  P({args.p2} wins) = {result['p2_win_prob']:.3f}")
+
+    if args.odds_p1 is not None:
+        print(value_bet_analysis(args.p1, result["p1_win_prob"], result["p1_win_ci90"], args.odds_p1))
+    if args.odds_p2 is not None:
+        p2_ci90 = (1.0 - result["p1_win_ci90"][1], 1.0 - result["p1_win_ci90"][0])
+        print(value_bet_analysis(args.p2, result["p2_win_prob"], p2_ci90, args.odds_p2))
 
 
 if __name__ == "__main__":
