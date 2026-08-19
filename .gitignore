@@ -3,3 +3,5 @@ __pycache__/
 atp_matches_pretrain.csv
 eval_out/
 *.log
+*.md
+.claude/
