@@ -1,76 +1,115 @@
 #!/usr/bin/env python3
 """
-fetch_bracket.py — Download an ATP tournament draw from diretta.it (Flashscore)
-================================================================================
-Converts a diretta.it "tabellone" (draw) page into the bracket JSON schema
-consumed by tournament_v2.py.
+fetch_bracket.py — download an ATP draw from diretta.it (Flashscore) into the
+bracket JSON used by tournament_v2.py. No browser needed: the tournament page's
+static HTML carries the tournament/stage ids and the feed signature, and the
+draw feed (`.../feed/dr_<tournamentId>_<stageId>`) is plain text.
 
-Why scrape the rendered page instead of the underlying feed API
------------------------------------------------------------------
-diretta.it is a Flashscore-family SPA: the draw is fetched client-side from
-`https://400.flashscore.ninja/400/x/feed/dr_<tournamentId>_<stageId>`, but
-that request requires a signed `x-fsign` header that's computed by obfuscated
-JS and re-derived per session — not worth reverse-engineering for a stable
-script. Instead this script drives a real (headless) Chromium via Playwright,
-lets the page render normally, and reads the already-rendered draw straight
-out of the DOM (`.draw__round` / `.draw__bracket` / `.bracket__result`
-elements), which is exactly what a human reading the page sees.
+  python3.12 fetch_bracket.py --tournament cincinnati --out cincinnati.json
+  python3.12 fetch_bracket.py --url https://www.diretta.it/tennis/atp-singolare/us-open/ --out usopen.json
 
-Why --url instead of --tournament/--year auto-lookup
---------------------------------------------------------
-Flashscore's tournament-search endpoint (that would map "Wimbledon"+2026 ->
-its internal tournamentId/stageId pair) was not identified within this
-script's scope — the tabellone URL itself already encodes those ids
-(.../tabellone/<tournamentId>/tabellone/ or .../tabellone/<stageId>/...).
-Rather than guess at a fragile lookup, you supply the tabellone URL directly
-(copy it from the browser address bar); everything else is automatic. A
---tournament/--year convenience mode is provided for the four Slams via a
-small hardcoded slug table, but it still requires you to have visited the
-page once to confirm the slug is current.
-
-Name resolution
-------------------
-Flashscore renders players as "Surname(s) X." (surname + first-initial).
-The ATP dataset (tennis_atp/) has full "Firstname Surname(s)" names. This
-script matches by (normalized surname suffix + first-initial), reusing the
-name index built the same way predict_v2.py's resolve_player() does so the
-resolved names are guaranteed valid inputs to tournament_v2.py. Ambiguous or
-unresolved names are printed for manual review and left as the raw
-Flashscore string in the output JSON (tournament_v2.py will fail loudly on
-those rather than silently mis-resolving).
-
-Usage
--------
-  python3.12 fetch_bracket.py --url "https://www.diretta.it/tennis/atp-singolare/wimbledon/tabellone/xY6rfy4l/tabellone/" \\
-      --out wimbledon_2026.json
-
-  python3.12 fetch_bracket.py --tournament wimbledon --year 2026 --out wimbledon_2026.json
+Output = ONLY the part of the draw still to be played: completed leading rounds
+are collapsed into `players` (the survivors, in bracket order); a round that is
+partially played is kept with its known winners in results_so_far (None for
+matches not yet played). Byes are resolved (the non-bye side advances).
+Player names are mapped to the ATP dataset via the feed's full-name slugs
+(e.g. `alcaraz-garfia-carlos`), falling back to surname+initial matching.
 """
 import argparse
 import json
 import re
 import sys
 import unicodedata
+import urllib.request
 from typing import Dict, List, Optional
 
-from predict_v2 import build_name_index
+import ssl
+try:
+    import certifi
+    _SSL = ssl.create_default_context(cafile=certifi.where())
+except ImportError:
+    _SSL = ssl.create_default_context()
 
-# Known tabellone URLs for the four Slams. Stage ids change every year and
-# are NOT guessable from tournament+year alone (see module docstring) — fill
-# these in by visiting diretta.it once per edition and copying the URL.
-KNOWN_SLAM_URLS: Dict[str, Dict[int, str]] = {
-    "wimbledon": {
-        2026: "https://www.diretta.it/tennis/atp-singolare/wimbledon/tabellone/xY6rfy4l/tabellone/",
-    },
-}
+UA = {"User-Agent": "Mozilla/5.0"}
+BASE = "https://www.diretta.it/tennis/atp-singolare/"
+SLAMS = {"wimbledon", "french-open", "roland-garros", "us-open", "australian-open"}
+GRASS = {"wimbledon", "halle", "queens", "queen-s-club", "eastbourne", "stuttgart", "s-hertogenbosch", "mallorca", "newport"}
+CLAY = {"french-open", "roland-garros", "roma", "rome", "madrid", "monte-carlo", "montecarlo", "barcellona", "barcelona",
+        "amburgo", "hamburg", "bastad", "gstaad", "kitzbuhel", "umag", "estoril", "houston", "buenos-aires", "rio-de-janeiro",
+        "santiago", "cordoba", "marrakech", "munich", "monaco-di-baviera", "geneva", "ginevra", "lyon", "bucharest", "belgrado"}
 
-SLAM_SLUGS = {"wimbledon", "roland-garros", "french-open", "us-open", "australian-open"}
+
+def _get(url: str) -> str:
+    return urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=20, context=_SSL).read().decode("utf-8", "replace")
+
+
+def resolve_tournament(slug_or_url: str) -> Dict:
+    """diretta slug ('cincinnati') or any diretta tournament URL -> ids + feed sign."""
+    url = slug_or_url if slug_or_url.startswith("http") else BASE + slug_or_url.strip("/") + "/"
+    url = re.sub(r"(atp-singolare/[^/]+/).*", r"\1tabellone/", url)
+    html = _get(url)
+    g = lambda pat: (re.search(pat, html) or [None, None])[1]
+    tid, sid, sign = g(r'tournamentId":"([A-Za-z0-9]{8})'), g(r'tournamentStageId: "([A-Za-z0-9]{8})'), g(r'feed_sign":"([A-Za-z0-9]+)')
+    if not (tid and sid and sign):
+        raise SystemExit(f"Could not find tournament ids on {url} (tid={tid} sid={sid} sign={sign})")
+    slug = re.search(r"atp-singolare/([^/]+)/", url).group(1)
+    return dict(url=url, slug=slug, tournament_id=tid, stage_id=sid, feed_sign=sign, project=g(r'projectId":(\d+)') or "400")
+
+
+def fetch_draw(t: Dict) -> Dict:
+    """-> {'names': {idx: 'Sinner J.'}, 'slugs': {idx: 'sinner-jannik'}, 'rounds': [[match,...],...]}
+    match = {'home': idx|None, 'away': idx|None, 'winner': idx|None, 'played': bool}"""
+    raw = urllib.request.urlopen(urllib.request.Request(
+        f"https://{t['project']}.flashscore.ninja/{t['project']}/x/feed/dr_{t['tournament_id']}_{t['stage_id']}",
+        headers={**UA, "x-fsign": t["feed_sign"]}), timeout=20, context=_SSL).read().decode("utf-8", "replace")
+    segs = [s for s in raw.split("~") if s]
+    kv = lambda s: dict(f.split("÷", 1) for f in s.split("¬") if "÷" in f)
+    names = {int(x.split("_", 1)[0]): x.split("_", 1)[1] for x in kv(segs[0])["PA"].split("|")}
+    slugs, rounds = {}, []
+    for s in segs:
+        d = kv(s)
+        if "RI" in d:
+            rounds.append([])
+        if rounds and ("HP" in d or "AP" in d):
+            h, a = (int(d["HP"]) if d.get("HP") not in (None, "") else None), (int(d["AP"]) if d.get("AP") not in (None, "") else None)
+            if h is not None and not names.get(h): h = None   # bye slot has empty name
+            if a is not None and not names.get(a): a = None
+            if "RQ" in d:  # 'id;hp;ap;ts;score;winner;home-slug;away-slug;...'
+                p = d["RQ"].split(";")
+                if len(p) > 7:
+                    if h is not None and p[6]: slugs[h] = p[6]
+                    if a is not None and p[7]: slugs[a] = p[7]
+            wi = d.get("WI")
+            winner = int(wi) if wi not in (None, "", "-1") else None
+            if winner is None and (h is None) != (a is None):   # bye
+                winner = h if h is not None else a
+            rounds[-1].append(dict(home=h, away=a, winner=winner, played=winner is not None))
+    return dict(names=names, slugs=slugs, rounds=rounds)
 
 
 def _norm(s: str) -> str:
     s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
-    s = s.replace("-", " ")
-    return re.sub(r"\s+", " ", s).strip().lower()
+    return re.sub(r"\s+", " ", s.replace("-", " ")).strip().lower()
+
+
+def make_resolver(name_index: Dict[str, int], full_names: Dict[int, str], last_active: Dict[int, int]):
+    """Returns f(display_name, slug) -> ATP full name or None."""
+    by_tokens: Dict[frozenset, List[int]] = {}
+    for key, pid in name_index.items():
+        by_tokens.setdefault(frozenset(key.split()), []).append(pid)
+
+    def resolve(display: str, slug: Optional[str]) -> Optional[str]:
+        if slug:
+            toks = _norm(slug).split()
+            cands = by_tokens.get(frozenset(toks), [])
+            if not cands and len(toks) > 2:   # 'o-connell-christopher' vs ATP 'Christopher Oconnell'
+                cands = [p for k, ps in by_tokens.items() if k == frozenset(("".join(toks[:2]), *toks[2:])) for p in ps]
+            if len(cands) == 1:
+                return full_names[cands[0]]
+            if len(cands) > 1:
+                return full_names[max(cands, key=lambda p: last_active.get(p, 0))]
+        return resolve_flashscore_name(display, name_index, full_names, last_active)
+    return resolve
 
 
 def resolve_flashscore_name(fs_name: str, name_index: Dict[str, int],
@@ -121,240 +160,89 @@ def resolve_flashscore_name(fs_name: str, name_index: Dict[str, int],
     return full_names[candidates[0]]
 
 
-def scrape_draw(url: str, headless: bool = True) -> List[Dict]:
-    """Returns a list of rounds: [{"round": str, "matches": [...]}], each
-    match = {"home": {"name","seed"}, "homeScore", "away": {...}, "awayScore"}."""
-    from playwright.sync_api import sync_playwright
-
-    extract_js = """
-    () => {
-      function parseRow(row) {
-        if (!row) return null;
-        const nameEl = row.querySelector('.wcl-participants_ASufu');
-        const seedEl = Array.from(row.children).find(c => c.tagName === 'SPAN');
-        return {
-          name: nameEl ? nameEl.innerText.trim() : null,
-          seed: seedEl ? seedEl.innerText.trim() : null
-        };
-      }
-      const rounds = document.querySelectorAll('.draw__round');
-      const out = [];
-      rounds.forEach((r) => {
-        const roundName = (r.querySelector('div,span') || {}).innerText || '';
-        const brackets = r.querySelectorAll('.draw__bracket');
-        const matches = [];
-        brackets.forEach(b => {
-          const home = b.querySelector('.bracket__participantRow--home');
-          const away = b.querySelector('.bracket__participantRow--away');
-          const homeScore = (b.querySelector('.bracket__result--home .bracket__score') || {}).innerText ?? null;
-          const awayScore = (b.querySelector('.bracket__result--away .bracket__score') || {}).innerText ?? null;
-          matches.push({ home: parseRow(home), homeScore, away: parseRow(away), awayScore });
-        });
-        out.push({ round: roundName, matches });
-      });
-      return out;
-    }
-    """
-
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=headless)
-        page = browser.new_page(user_agent=(
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"))
-        page.goto(url, wait_until="networkidle", timeout=30000)
-        page.wait_for_selector(".draw__round", timeout=15000)
-        page.wait_for_timeout(1500)  # let the draw feed request settle
-        rounds = page.evaluate(extract_js)
-        browser.close()
-    return rounds
 
 
-_RETIRED_TAG = re.compile(r"RET|W\.?O\.?|WALKOVER", re.IGNORECASE)
-
-
-def match_winner_side(m: Dict) -> Optional[str]:
-    """Returns 'home'/'away'/None. Handles the tied-score-at-retirement case
-    (e.g. 'Bonzi B. (RET.) 2 - Diallo G. 2'): the set score alone doesn't
-    determine the winner there, the (RET.)/(W.O.) tag on the loser does."""
-    if not m["home"] or not m["away"] or not m["home"]["name"] or not m["away"]["name"]:
-        return None
-    if m["homeScore"] is None or m["awayScore"] is None:
-        return None
-    try:
-        h, a = int(m["homeScore"]), int(m["awayScore"])
-    except (TypeError, ValueError):
-        return None
-    if h != a:
-        return "home" if h > a else "away"
-    home_ret = bool(m["home"]["seed"] and _RETIRED_TAG.search(m["home"]["seed"]))
-    away_ret = bool(m["away"]["seed"] and _RETIRED_TAG.search(m["away"]["seed"]))
-    if home_ret and not away_ret:
-        return "away"
-    if away_ret and not home_ret:
-        return "home"
-    return None  # genuine tie / unresolvable — treat as not decided
-
-
-def round_is_complete(matches: List[Dict]) -> bool:
-    return all(match_winner_side(m) is not None for m in matches)
-
-
-def winner_name(m: Dict) -> str:
-    side = match_winner_side(m)
-    return m[side]["name"]
-
-
-def load_full_names_and_last_active(data_dir: str) -> "tuple[Dict[str, int], Dict[int, str], Dict[int, int]]":
-    """Returns (name_index, full_names, last_active): name_index maps
-    normalized 'first last' -> player_id (predict_v2's index); full_names
-    maps player_id -> a nicely-cased name as it appears in the raw ATP CSVs;
-    last_active maps player_id -> the tourney_date (YYYYMMDD int) of their
-    most recent match, used to break surname+initial ties in favor of the
-    currently-active tour player."""
+def load_full_names_and_last_active(data_dir: str = "tennis_atp"):
+    """(name_index, full_names, last_active). From deploy/state.pkl when the
+    raw data isn't there (Streamlit Cloud), else from tennis_atp/ CSVs."""
+    import os, pickle
+    if not os.path.isdir(data_dir) and os.path.exists("deploy/state.pkl"):
+        snap = pickle.load(open("deploy/state.pkl", "rb"))
+        return snap["name_index"], snap["full_names"], snap["last_active"]
     import glob
     import pandas as pd
-
+    from predict_v2 import build_name_index
     name_index = build_name_index(data_dir)
-    full_names: Dict[int, str] = {}
-    for key, pid in name_index.items():
-        full_names.setdefault(pid, key)  # any normalized variant is fine; overwritten with nice casing below
-    last_active: Dict[int, int] = {}
+    full_names, last_active = {}, {}
     for fp in sorted(glob.glob(f"{data_dir}/atp_matches_????.csv")):
-        try:
-            d = pd.read_csv(fp, usecols=["tourney_date", "winner_id", "winner_name", "loser_id", "loser_name"],
-                             low_memory=False)
-        except Exception:
-            continue
-        for _, r in d.iterrows():
-            date = int(r["tourney_date"]) if pd.notna(r["tourney_date"]) else 0
-            if pd.notna(r["winner_id"]):
-                pid = int(r["winner_id"])
-                full_names[pid] = r["winner_name"]
-                last_active[pid] = max(last_active.get(pid, 0), date)
-            if pd.notna(r["loser_id"]):
-                pid = int(r["loser_id"])
-                full_names[pid] = r["loser_name"]
-                last_active[pid] = max(last_active.get(pid, 0), date)
+        d = pd.read_csv(fp, usecols=["tourney_date", "winner_id", "winner_name", "loser_id", "loser_name"], low_memory=False)
+        for side in ("winner", "loser"):
+            for pid, name, date in zip(d[f"{side}_id"], d[f"{side}_name"], d["tourney_date"]):
+                if pd.notna(pid):
+                    pid = int(pid); full_names[pid] = name; last_active[pid] = max(last_active.get(pid, 0), int(date))
     return name_index, full_names, last_active
 
 
-def build_bracket_json(rounds: List[Dict], surface: str, best_of: int, is_slam: bool,
-                        data_dir: str) -> Dict:
-    if not rounds or not rounds[0]["matches"]:
-        raise ValueError("No draw data found on the page (selectors may be stale).")
-
-    name_index, full_names, last_active = load_full_names_and_last_active(data_dir)
-
-    round1 = rounds[0]["matches"]
-    players_fs, players_resolved, unresolved = [], [], []
-    for m in round1:
-        for side in ("home", "away"):
-            fs_name = m[side]["name"] or "?"
-            resolved = resolve_flashscore_name(fs_name, name_index, full_names, last_active)
-            players_fs.append(fs_name)
-            if resolved is None:
-                unresolved.append(fs_name)
-                players_resolved.append(fs_name)  # tournament_v2.py now warns + excludes rather than crashing
-            else:
-                players_resolved.append(resolved)
-
-    results_so_far = []
-    for rnd in rounds:
-        if round_is_complete(rnd["matches"]):
-            winners = []
-            for m in rnd["matches"]:
-                w_fs = winner_name(m)
-                resolved = resolve_flashscore_name(w_fs, name_index, full_names, last_active)
-                if resolved is None:
-                    unresolved.append(w_fs)
-                winners.append(resolved if resolved else w_fs)
-            results_so_far.append(winners)
-        else:
-            break  # rounds must be fixed as a contiguous prefix (see tournament_v2.py)
-
-    # Re-anchor to whatever's still open: any fully-completed leading rounds
-    # are collapsed into the `players` list itself (as the survivors who
-    # enter the next, not-yet-played round) instead of being carried as a
-    # results_so_far prefix. The output bracket then contains ONLY the
-    # matches still to be played — already-finished rounds (and any
-    # already-eliminated players in them, including unresolvable
-    # qualifiers/wildcards with zero ATP history — see the name-resolution
-    # warnings) are dropped entirely rather than replayed by the simulator.
-    if results_so_far:
-        print(f"\n{len(results_so_far)} round(s) already complete — re-anchoring bracket to the "
-              f"{len(results_so_far[-1])} surviving players and the matches still to be played "
-              f"(dropping the original {len(players_resolved)}-player draw and finished rounds).",
-              file=sys.stderr)
-        players_resolved = results_so_far[-1]
-        results_so_far = []
-
-    if unresolved:
-        unresolved = sorted(set(unresolved))
-        print(f"\n{len(unresolved)} player name(s) could not be resolved against the ATP dataset "
-              f"(no ATP tour-level history) — left as raw Flashscore strings in the output. "
-              f"tournament_v2.py will print a warning and treat them as an automatic loss rather "
-              f"than crash:", file=sys.stderr)
-        for n in unresolved:
-            print(f"  - {n}", file=sys.stderr)
-        print("Fix by editing the output JSON by hand if you know the correct ATP name.\n",
-              file=sys.stderr)
-
-    return {
-        "surface": surface,
-        "best_of": best_of,
-        "is_slam": is_slam,
-        "players": players_resolved,
-        "results_so_far": results_so_far,
-    }
+def build_bracket(draw: Dict, resolve, surface: str, best_of: int, is_slam: bool) -> Dict:
+    """Collapse finished rounds; emit only what is still to be played."""
+    names, slugs, rounds = draw["names"], draw["slugs"], draw["rounds"]
+    name_of = lambda i: None if i is None else (resolve(names[i], slugs.get(i)) or names[i])
+    unresolved = set()
+    def nm(i):
+        n = name_of(i)
+        if i is not None and resolve(names[i], slugs.get(i)) is None:
+            unresolved.add(names[i])
+        return n
+    # first round with at least one unplayed match
+    open_idx = next((k for k, r in enumerate(rounds) if any(not m["played"] for m in r)), None)
+    if open_idx is None:   # tournament over
+        champ = rounds[-1][0]["winner"]
+        return dict(surface=surface, best_of=best_of, is_slam=is_slam, players=[], results_so_far=[],
+                    finished=True, champion=name_of(champ), unresolved=[])
+    rnd = rounds[open_idx]
+    players = [p for m in rnd for p in (nm(m["home"]), nm(m["away"]))]
+    if any(p is None for p in players):   # future round whose participants aren't set yet -> step back one
+        rnd = rounds[open_idx - 1]
+        players = [p for m in rnd for p in (nm(m["home"]), nm(m["away"]))]
+    partial = [nm(m["winner"]) if m["played"] else None for m in rnd]
+    results = [partial] if any(partial) else []
+    return dict(surface=surface, best_of=best_of, is_slam=is_slam, players=players, results_so_far=results,
+                finished=False, round_index=open_idx, rounds_total=len(rounds),
+                unresolved=sorted(unresolved))
 
 
-def resolve_url(args) -> str:
-    if args.url:
-        return args.url
-    slug = args.tournament.lower()
-    table = KNOWN_SLAM_URLS.get(slug)
-    if not table or args.year not in table:
-        raise SystemExit(
-            f"No known tabellone URL for {args.tournament} {args.year}. "
-            f"Visit diretta.it, open the tournament's 'Tabellone' tab, and pass "
-            f"--url <that address> instead (or add it to KNOWN_SLAM_URLS)."
-        )
-    return table[args.year]
+def infer_format(slug: str):
+    slam = slug in SLAMS
+    surface = "Grass" if slug in GRASS else "Clay" if slug in CLAY else "Hard"
+    return surface, (5 if slam else 3), slam
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--url", type=str, help="diretta.it tabellone URL")
-    ap.add_argument("--tournament", type=str, help="slug, e.g. wimbledon (requires --year, see KNOWN_SLAM_URLS)")
-    ap.add_argument("--year", type=int)
-    ap.add_argument("--surface", type=str, default=None, help="override auto-detected surface")
-    ap.add_argument("--best-of", type=int, default=None, help="override auto-detected best-of")
-    ap.add_argument("--slam", action="store_true", help="force is_slam=true")
-    ap.add_argument("--data-dir", type=str, default="tennis_atp")
-    ap.add_argument("--out", type=str, required=True)
-    ap.add_argument("--show-browser", action="store_true", help="run non-headless (debugging)")
-    args = ap.parse_args()
-
-    if not args.url and not (args.tournament and args.year):
-        ap.error("pass --url, or --tournament + --year")
-
-    url = resolve_url(args)
-    slug_guess = next((s for s in SLAM_SLUGS if s in url), None)
-    is_slam = args.slam or (slug_guess is not None)
-    surface = args.surface or ("Grass" if slug_guess == "wimbledon" else
-                                "Clay" if slug_guess in ("roland-garros", "french-open") else "Hard")
-    best_of = args.best_of or (5 if is_slam else 3)
-
-    print(f"Fetching draw from {url} ...", file=sys.stderr)
-    rounds = scrape_draw(url, headless=not args.show_browser)
-    print(f"Got {len(rounds)} round(s): " +
-          ", ".join(f"{r['round']}({len(r['matches'])})" for r in rounds), file=sys.stderr)
-
-    bracket = build_bracket_json(rounds, surface, best_of, is_slam, args.data_dir)
-    with open(args.out, "w") as f:
-        json.dump(bracket, f, indent=2, ensure_ascii=False)
-    print(f"Saved -> {args.out} ({len(bracket['players'])} players, "
-          f"{len(bracket['results_so_far'])} round(s) fixed)", file=sys.stderr)
+    ap.add_argument("--tournament", help="diretta.it slug, e.g. cincinnati, us-open, wimbledon")
+    ap.add_argument("--url", help="any diretta.it URL of the tournament")
+    ap.add_argument("--surface"); ap.add_argument("--best-of", type=int); ap.add_argument("--slam", action="store_true")
+    ap.add_argument("--data-dir", default="tennis_atp")
+    ap.add_argument("--out", required=True)
+    a = ap.parse_args()
+    if not (a.tournament or a.url):
+        ap.error("--tournament or --url")
+    t = resolve_tournament(a.url or a.tournament)
+    surface, best_of, slam = infer_format(t["slug"])
+    surface, best_of, slam = a.surface or surface, a.best_of or best_of, a.slam or slam
+    draw = fetch_draw(t)
+    resolve = make_resolver(*load_full_names_and_last_active(a.data_dir))
+    b = build_bracket(draw, resolve, surface, best_of, slam)
+    if b["finished"]:
+        print(f"{t['slug']}: tournament finished, champion {b['champion']}", file=sys.stderr)
+    else:
+        print(f"{t['slug']}: round {b['round_index']+1}/{b['rounds_total']} open — {len(b['players'])} players, "
+              f"{sum(1 for w in (b['results_so_far'][0] if b['results_so_far'] else []) if w)} match(es) of it already played",
+              file=sys.stderr)
+    if b["unresolved"]:
+        print(f"  unresolved names (no ATP history; treated as auto-loss by tournament_v2): {', '.join(b['unresolved'])}", file=sys.stderr)
+    json.dump({k: b[k] for k in ("surface", "best_of", "is_slam", "players", "results_so_far")}, open(a.out, "w"), indent=2, ensure_ascii=False)
+    print(f"Saved -> {a.out}", file=sys.stderr)
 
 
 if __name__ == "__main__":

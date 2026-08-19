@@ -131,8 +131,8 @@ def simulate(players: List[str], P_samples: np.ndarray, results_so_far: Optional
             winners = []
             for m in range(len(alive) // 2):
                 a, b = alive[2 * m], alive[2 * m + 1]
-                if fixed_round is not None:
-                    w_name = fixed_round[m]
+                w_name = fixed_round[m] if fixed_round is not None else None
+                if w_name is not None:   # None = this match of a partially-played round is still open
                     w = name_to_idx[w_name] if w_name in name_to_idx else (a if players[a] == w_name else b)
                 else:
                     # Draw a fresh MC-dropout sample of P(a beats b) for THIS
