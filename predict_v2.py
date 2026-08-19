@@ -174,7 +174,7 @@ def predict_match_prob(pid1: int, pid2: int, surface: str, best_of: int, is_slam
     p2_idx = np.array([vocab.get(pid2, 0)])
 
     # Calibration method (raw / isotonic / platt) was picked at training time
-    # by validation-fold ECE, not hardcoded — see model_v2.choose_calibration
+    # by validation-fold log-loss, not hardcoded — see model_v2.choose_calibration
     # and MODEL_V2_REPORT.md sect. 4.5/5.2 (isotonic/Platt do not always beat
     # an already well-calibrated raw probability on a small calib fold).
     calib_fn = lambda p: apply_calibration(prep_art["nn_calib_method"], p, prep_art["iso_nn"], prep_art["platt_nn"])
@@ -183,15 +183,25 @@ def predict_match_prob(pid1: int, pid2: int, surface: str, best_of: int, is_slam
     # repeat runs of the same query must return the same probability, and
     # this is also what the model was calibrated/evaluated with. MC-dropout
     # (Gal & Ghahramani, 2016) is used ONLY for the uncertainty interval.
-    raw = embedding_net_predict(state["net"], p1_idx, p2_idx, Xp)
-    p_point = float(calib_fn(raw)[0])
+    # Symmetrized scoring: average f(p1,p2) with 1-f(p2,p1) so the output is
+    # EXACTLY antisymmetric under swapping the two players (the network is
+    # trained with swap augmentation to be nearly so; this removes the
+    # residual order dependence entirely — same idea as test-time
+    # augmentation over a known invariance).
+    Xs, _ = engineer_features(build_match_row(pid2, pid1, surface, best_of, is_slam, state))
+    Xsp = prep_art["scaler"].transform(prep_art["imputer"].transform(Xs.values))
+    X2 = np.vstack([Xp, Xsp]); i1 = np.concatenate([p1_idx, p2_idx]); i2 = np.concatenate([p2_idx, p1_idx])
+    sym = lambda p: 0.5 * (p[..., 0] + 1.0 - p[..., 1])
+
+    raw = embedding_net_predict(state["net"], i1, i2, X2)
+    p_point = float(sym(calib_fn(raw)))
     if n_mc <= 1:
         lo = hi = p_point
         p1_win_samples = np.array([p_point])
     else:
-        _, samples = embedding_net_mc_predict(state["net"], p1_idx, p2_idx, Xp, n_samples=n_mc)
+        _, samples = embedding_net_mc_predict(state["net"], i1, i2, X2, n_samples=n_mc)
         p_cal_samples = calib_fn(samples.reshape(-1)).reshape(samples.shape)
-        p1_win_samples = p_cal_samples[:, 0]
+        p1_win_samples = sym(p_cal_samples)
         lo, hi = np.percentile(p1_win_samples, [10, 90])
 
     return dict(
@@ -245,17 +255,88 @@ def value_bet_analysis(label: str, model_p: float, ci90: "tuple[float, float]", 
         f"  Expected value per 1 staked:   {ev_per_unit:+.3f}",
     ]
     if lo > implied_p:
-        lines.append(f"  => VALUE BET: edge holds even at the pessimistic end of the CI. "
-                      f"Suggested stake: {kelly_quarter:.1%} of bankroll (quarter-Kelly; "
-                      f"full Kelly would be {kelly_full:.1%}).")
+        lines.append(f"  => VALUE BET: even in the pessimistic case the true probability still beats "
+                      f"the break-even {implied_p:.3f}. Per 100 staked: win +{100*(decimal_odds-1):.0f} "
+                      f"(P={model_p:.2f}) / lose -100 (P={1-model_p:.2f}) → {ev_per_unit*100:+.1f} on average.")
     elif model_p > implied_p:
-        lines.append(f"  => MARGINAL: positive edge at the point estimate, but the CI lower "
-                      f"bound ({lo:.3f}) falls below the implied probability — the edge is not "
-                      f"robust to the model's own uncertainty. Bet small or skip.")
+        lines.append(f"  => MARGINAL: positive on average, but in the pessimistic case "
+                      f"(P={lo:.3f}) you'd be below break-even ({implied_p:.3f}) — the model isn't "
+                      f"sure enough. Per 100 staked: {ev_per_unit*100:+.1f} on average, but could be "
+                      f"{(lo*decimal_odds-1)*100:+.1f}. Bet small or skip.")
     else:
-        lines.append(f"  => NO BET: model probability does not beat the market's implied "
-                      f"probability — negative expected value.")
+        lines.append(f"  => NO BET: you need P > {implied_p:.3f} to break even at these odds, the "
+                      f"model says {model_p:.3f} — you lose {-ev_per_unit*100:.1f} per 100 on average.")
     return "\n".join(lines)
+
+
+def optimal_allocation(p1: float, p2_prob: float, o1: float, o2: float, kelly_fraction: float = 0.25):
+    """Growth-optimal stake split across BOTH sides of a 2-outcome market.
+
+    Betting f1 on player 1 and f2 on player 2 (fractions of bankroll), the
+    log-growth to maximize is
+        p*log(1 + f1*(o1-1) - f2) + (1-p)*log(1 - f1 + f2*(o2-1))
+    i.e. multi-outcome Kelly (Kelly 1956; Thorp 2006). Two regimes fall out
+    of it automatically, which is why this is solved numerically rather
+    than with the single-bet formula:
+      - 1/o1 + 1/o2 >= 1 (the normal case, the book has a margin): the
+        optimum puts money on AT MOST one side — hedging both sides of a
+        margin-carrying market strictly loses. Betting "both at 2.00 to
+        break even" is only break-even, never profitable.
+      - 1/o1 + 1/o2 < 1 (arbitrage; happens across two different books):
+        the optimum backs both sides and locks a risk-free profit,
+        independent of the model.
+    Returns (f1, f2) already scaled by `kelly_fraction` (default quarter-
+    Kelly, the standard haircut for an estimated rather than known p).
+    """
+    from scipy.optimize import minimize
+    p = float(np.clip(p1, 1e-6, 1 - 1e-6))
+    neg_growth = lambda f: -(p * np.log(max(1e-9, 1 + f[0] * (o1 - 1) - f[1]))
+                             + (1 - p) * np.log(max(1e-9, 1 - f[0] + f[1] * (o2 - 1))))
+    best = min((minimize(neg_growth, x0, bounds=[(0, 0.95), (0, 0.95)], method="L-BFGS-B")
+                for x0 in ([0.0, 0.0], [0.1, 0.0], [0.0, 0.1], [0.1, 0.1])), key=lambda r: r.fun)
+    f1, f2 = (max(0.0, v) * kelly_fraction for v in best.x)
+    return (0.0 if f1 < 1e-4 else f1), (0.0 if f2 < 1e-4 else f2)
+
+
+def staking_plan(n1: str, n2: str, p1: float, ci1, o1: float, o2: float,
+                 kelly_fraction: float = 0.25) -> str:
+    """One combined recommendation given odds on BOTH players: who to back,
+    how much, and the same CI-robustness check value_bet_analysis applies
+    per side (an edge that vanishes at the pessimistic end of the model's
+    own 90% interval is flagged, not silently staked)."""
+    p2 = 1.0 - p1
+    lo, hi = ci1
+    f1, f2 = optimal_allocation(p1, p2, o1, o2, kelly_fraction)
+    overround = 1 / o1 + 1 / o2
+    out = [f"\n  --- Which side, if any ---",
+           f"  Odds {n1} {o1:.2f} (implied {1/o1:.3f}) | {n2} {o2:.2f} (implied {1/o2:.3f}) "
+           f"| book overround {overround:.3f}"]
+    if overround < 1:
+        # Stake in proportion to implied probabilities -> identical payout
+        # whoever wins: guaranteed return 1/overround per unit staked.
+        w1, w2 = (1 / o1) / overround, (1 / o2) / overround
+        out.append(f"  ARBITRAGE: implied probabilities sum to {overround:.3f} < 1 — split ANY "
+                   f"stake {w1:.1%} on {n1} / {w2:.1%} on {n2} for a risk-free "
+                   f"{1 / overround - 1:+.2%} return, model-independent.")
+        return "\n".join(out)
+    # Risk/reward per side, in the terms a bettor thinks in: per 100 staked,
+    # what you win, what you lose, how often, and the break-even probability
+    # 1/odds you must beat. Kelly's stake is derived from exactly these
+    # (f* = edge / (odds-1): small payoff => small stake even at high p).
+    for name, p_side, ci_lo, odds in ((n1, p1, lo, o1), (n2, p2, 1 - hi, o2)):
+        ev100 = 100 * (p_side * odds - 1)
+        out.append(f"  {name:<22} per 100 staked: win +{100*(odds-1):.0f} (P={p_side:.3f}) / lose -100 "
+                   f"(P={1-p_side:.3f}) | break-even P={1/odds:.3f} | EV {ev100:+.1f}")
+    if f1 == 0 and f2 == 0:
+        out.append(f"  => NO BET: neither side beats its break-even probability.")
+        return "\n".join(out)
+    for name, f, p_side, ci_lo, odds in ((n1, f1, p1, lo, o1), (n2, f2, p2, 1 - hi, o2)):
+        if f == 0:
+            continue
+        robust = ci_lo > 1 / odds
+        out.append(f"  => BET on {name} @ {odds:.2f}: {100*(p_side*odds-1):+.1f} per 100 on average "
+                   f"— {'robust: still positive in the pessimistic case' if robust else f'MARGINAL: could be {100*(ci_lo*odds-1):+.1f} per 100 in the pessimistic case'}")
+    return "\n".join(out)
 
 
 def main():
@@ -275,6 +356,10 @@ def main():
                          "(Bo3 non-Slam vs Bo5 Slam on Hard/Clay/Grass) instead of a single prediction")
     ap.add_argument("--odds-p1", type=float, default=None,
                     help="bookmaker decimal odds on --p1 to win (e.g. 2.10) — prints a value-bet check")
+    ap.add_argument("--kelly", type=float, default=0.25,
+                    help="Kelly fraction for stake sizing (0.25 = quarter-Kelly, the default haircut)")
+    ap.add_argument("--news", action="store_true",
+                    help="print recent injury/withdrawal headlines for both players (Google News RSS, English)")
     ap.add_argument("--odds-p2", type=float, default=None,
                     help="bookmaker decimal odds on --p2 to win — prints a value-bet check")
     args = ap.parse_args()
@@ -343,6 +428,14 @@ def main():
     if args.odds_p2 is not None:
         p2_ci90 = (1.0 - result["p1_win_ci90"][1], 1.0 - result["p1_win_ci90"][0])
         print(value_bet_analysis(args.p2, result["p2_win_prob"], p2_ci90, args.odds_p2))
+    if args.news:
+        from news_v2 import fetch_news, format_news
+        for name in (args.p1, args.p2):
+            print(format_news(name, fetch_news(name)))
+        print("  (headlines are context the model does NOT see — e.g. a taped wrist — weigh them before staking)")
+    if args.odds_p1 and args.odds_p2:
+        print(staking_plan(args.p1, args.p2, result["p1_win_prob"], result["p1_win_ci90"],
+                           args.odds_p1, args.odds_p2, args.kelly))
 
 
 if __name__ == "__main__":

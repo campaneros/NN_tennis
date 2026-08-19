@@ -44,6 +44,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 
 from model_v2 import (
+    swap_sides,
     TennisEmbeddingNet, apply_calibration, build_player_vocab, choose_calibration,
     encode_ids, engineer_features, eval_metrics, expected_calibration_error,
     platt_apply, platt_fit, temporal_split, train_embedding_net, embedding_net_predict,
@@ -53,6 +54,28 @@ from model_v2 import (
 def elo_only_prob(df: pd.DataFrame) -> np.ndarray:
     diff = df["p1_elo"] - df["p2_elo"]
     return 1.0 / (1.0 + 10.0 ** (-diff / 400.0))
+
+
+def binary_entropy(p):
+    p = np.clip(p, 1e-6, 1 - 1e-6)
+    return -(p * np.log(p) + (1 - p) * np.log(1 - p))
+
+
+def training_arrays(df_tr, X_tr, y_tr, vocab, prep, args):
+    """(p1_idx, p2_idx, X_prepped, y) for the NN, optionally doubled with
+    the mirrored rows (swap_sides): teaches P(p1 wins|swap)=1-P directly."""
+    p1, p2 = encode_ids(df_tr, vocab, "p1_id"), encode_ids(df_tr, vocab, "p2_id")
+    Xp, yy = prep(X_tr), y_tr.astype(np.float32)
+    if args.no_swap_aug:
+        return p1, p2, Xp, yy
+    Xs, _ = engineer_features(swap_sides(df_tr))
+    return (np.concatenate([p1, p2]), np.concatenate([p2, p1]),
+            np.vstack([Xp, prep(Xs.values)]), np.concatenate([yy, 1 - yy]))
+
+
+def make_net(n_players, num_dim, args):
+    return TennisEmbeddingNet(n_players=n_players, num_dim=num_dim, emb_dim=args.emb_dim,
+                              player_dropout=args.player_dropout)
 
 
 def train_final(df, X, feature_cols, y, args):
@@ -94,14 +117,15 @@ def train_final(df, X, feature_cols, y, args):
     p1_se, p2_se = encode_ids(df[se], vocab1, "p1_id"), encode_ids(df[se], vocab1, "p2_id")
     Xtr_p, Xva_p, Xse_p = prep1(Xtr), prep1(Xva), prep1(Xse)
 
-    net1 = TennisEmbeddingNet(n_players=len(vocab1), num_dim=Xtr_p.shape[1], emb_dim=args.emb_dim)
+    net1 = make_net(len(vocab1), Xtr_p.shape[1], args)
     hist1 = train_embedding_net(
-        net1, p1_tr, p2_tr, Xtr_p, ytr.astype(np.float32),
+        net1, *training_arrays(df[tr], Xtr, ytr, vocab1, prep1, args),
         p1_va, p2_va, Xva_p, yva.astype(np.float32), device=args.device)
     best_epoch = int(np.argmin(hist1["val_loss"])) + 1
     print(f"  stage 1: best epoch by val log-loss = {best_epoch} (of {len(hist1['val_loss'])} run)")
 
     p_va = embedding_net_predict(net1, p1_va, p2_va, Xva_p, device=args.device)
+    stage1_entropy_floor = float(binary_entropy(p_va).mean())
     p_se = embedding_net_predict(net1, p1_se, p2_se, Xse_p, device=args.device)
     iso_nn = IsotonicRegression(out_of_bounds="clip").fit(p_va, yva)
     platt_nn = platt_fit(p_va, yva)
@@ -122,12 +146,13 @@ def train_final(df, X, feature_cols, y, args):
     p1_all, p2_all = encode_ids(df, vocab, "p1_id"), encode_ids(df, vocab, "p2_id")
     Xall_p = prep(X.values)
 
-    net = TennisEmbeddingNet(n_players=len(vocab), num_dim=Xall_p.shape[1], emb_dim=args.emb_dim)
+    net = make_net(len(vocab), Xall_p.shape[1], args)
     nn_history = train_embedding_net(
-        net, p1_all, p2_all, Xall_p, y.astype(np.float32),
+        net, *training_arrays(df, X.values, y, vocab, prep, args),
         epochs=best_epoch, device=args.device)
     nn_history["stage1_val_loss"] = hist1["val_loss"]
     nn_history["stage1_best_epoch"] = best_epoch
+    nn_history["val_entropy_floor"] = stage1_entropy_floor
 
     # Calibrators shipped are the stage-1 ones (fit on genuinely held-out
     # 2025-H2 predictions). When the selected method is "raw" — the case in
@@ -168,7 +193,13 @@ def main():
     ap.add_argument("--data", type=str, default="atp_matches_pretrain.csv")
     ap.add_argument("--out-dir", type=str, default="models_v2")
     ap.add_argument("--device", type=str, default="cpu")
-    ap.add_argument("--emb-dim", type=int, default=24)
+    ap.add_argument("--emb-dim", type=int, default=0,
+                    help="player-identity embedding size; 0 (default) = numeric features only, "
+                         "which is what wins out-of-time (report sect. 9)")
+    ap.add_argument("--player-dropout", type=float, default=0.0,
+                    help="only with --emb-dim>0: prob. of replacing a player id with OOV during training")
+    ap.add_argument("--no-swap-aug", action="store_true",
+                    help="disable p1<->p2 mirroring augmentation of the training rows")
     ap.add_argument("--final", action="store_true",
                     help="production refit on data through 2025-06 (see train_final); "
                          "use --out-dir models_v2_final to keep benchmark artifacts intact")
@@ -267,12 +298,18 @@ def main():
 
     Xtr_p, Xva_p, Xca_p, Xte_p = prep(Xtr), prep(Xva), prep(Xca), prep(Xte)
 
-    net = TennisEmbeddingNet(n_players=n_players, num_dim=Xtr_p.shape[1], emb_dim=args.emb_dim)
+    net = make_net(n_players, Xtr_p.shape[1], args)
     nn_history = train_embedding_net(
-        net, p1_tr, p2_tr, Xtr_p, ytr.astype(np.float32),
+        net, *training_arrays(df[tr], Xtr, ytr, vocab, prep, args),
         p1_va, p2_va, Xva_p, yva.astype(np.float32), device=args.device,
     )
     p_nn_val_raw = embedding_net_predict(net, p1_va, p2_va, Xva_p, device=args.device)
+    # Reference floor for the training plot: if the model's val probabilities
+    # were EXACTLY the true probabilities, expected log-loss would equal the
+    # mean binary entropy of those probabilities. val_loss - this = the
+    # calibration gap; this - 0 = the irreducible part at the model's current
+    # sharpness (only new information can lower it).
+    nn_history["val_entropy_floor"] = float(binary_entropy(p_nn_val_raw).mean())
     p_nn_calib_raw = embedding_net_predict(net, p1_ca, p2_ca, Xca_p, device=args.device)
     p_nn_test_raw = embedding_net_predict(net, p1_te, p2_te, Xte_p, device=args.device)
     results.append(eval_metrics(yte, p_nn_test_raw, "embedding_nn_raw"))
@@ -286,7 +323,7 @@ def main():
     results.append(eval_metrics(
         yte, apply_calibration(nn_calib_method, p_nn_test_raw, iso_nn, platt_nn),
         f"embedding_nn_SHIPPED[{nn_calib_method}]"))
-    print(f"  calibration method selected by validation-fold ECE: {nn_calib_method}")
+    print(f"  calibration method selected by validation-fold log-loss: {nn_calib_method}")
 
     # ── Report ────────────────────────────────────────────────────────────
     res_df = pd.DataFrame(results).set_index("model")
