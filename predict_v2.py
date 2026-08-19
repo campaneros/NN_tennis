@@ -121,6 +121,7 @@ def load_state(data_dir: str, out_dir: Optional[str] = None):
         with open(STATE_SNAPSHOT, "rb") as f:
             snap = pickle.load(f)
         tracker, name_index, last_date = snap["tracker"], snap["name_index"], snap["last_date"]
+        _CACHE["last_active"] = snap.get("last_active", {})
         print(f"Loaded player state snapshot {STATE_SNAPSHOT} (data through {last_date})", file=sys.stderr)
     else:
         print("Replaying full match history to build current player state (one-time)...", file=sys.stderr)
@@ -128,6 +129,7 @@ def load_state(data_dir: str, out_dir: Optional[str] = None):
         _, tracker = build_pretrain_table(df_raw)
         name_index = build_name_index(data_dir)
         last_date = int(df_raw["tourney_date"].max())
+        _CACHE["last_active"] = tracker.last_date   # pid -> last match date (for name-pick ordering)
 
     with open(f"{out_dir}/preprocessing.pkl", "rb") as f:
         prep_art = pickle.load(f)
