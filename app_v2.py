@@ -86,6 +86,29 @@ def parse_odds_line(line):
     return line[:m.start()].strip(" ,;:@"), float(m.group(1).replace(",", "."))
 
 
+def pick_player_ui(label, typed, s, key):
+    """Resolve a typed player name against the whole ATP name index, asking the
+    user to pick when it's a bare surname (several players) or a typo
+    (closest names). Returns the canonical name, or None."""
+    from predict_v2 import _norm_name
+    idx = s["name_index"]
+    if _norm_name(typed) in idx:
+        return typed
+    names = st.session_state.setdefault("_all_names", sorted(idx, key=lambda k: -s.get("last_active", {}).get(idx[k], 0)))
+    status, res = match_player(typed, names)
+    if status == "ok":
+        st.caption(f"{label}: '{typed}' → **{res.title()}**")
+        return res
+    if status == "choose":
+        pick = st.selectbox(f"{label}: '{typed}' matches several players — which one?", ["(choose)"] + [r.title() for r in res[:8]], key=key)
+        return None if pick == "(choose)" else pick
+    if res:
+        pick = st.selectbox(f"{label}: '{typed}' not found — did you mean:", ["(choose)"] + [r.title() for r in res], key=key)
+        return None if pick == "(choose)" else pick
+    st.warning(f"{label}: '{typed}' not found and no similar name")
+    return None
+
+
 def verdict_box(txt, label):
     verdict = txt.split("=> ")[-1].split(":")[0]
     {"VALUE BET": st.success, "MARGINAL": st.warning}.get(verdict, st.error)(f"{label}: **{verdict}**")
@@ -106,12 +129,11 @@ if action == "Predict match":
     o2 = c2.number_input(f"Odds on P2 (0 = none)", 0.0, 50.0, 0.0, 0.05)
     news = c2.checkbox("Search injury news (Google News, English)", value=True)
     out_dir = model_dir_picker()
-    if st.button("Run"):
-        s = state(out_dir)
+    s = state(out_dir)
+    p1 = pick_player_ui("Player 1", p1, s, "pick_p1") if p1.strip() else None
+    p2 = pick_player_ui("Player 2", p2, s, "pick_p2") if p2.strip() else None
+    if p1 and p2 and st.button("Run"):
         pid1, pid2 = resolve_player(p1, s["name_index"]), resolve_player(p2, s["name_index"])
-        if pid1 is None or pid2 is None:
-            st.error(f"Unresolved: p1→{pid1}, p2→{pid2}. Check spelling.")
-            st.stop()
         r = predict_match_prob(pid1, pid2, surface, best_of, slam, "tennis_atp", out_dir, n_mc)
         lo, hi = r["p1_win_ci90"]
         fig, ax = plt.subplots(figsize=(6, 3))
