@@ -48,6 +48,13 @@ _CACHE: Dict[str, object] = {}
 STATE_SNAPSHOT = "deploy/state.pkl"  # written by export_state.py
 
 
+def has_raw_data(data_dir: str = "tennis_atp") -> bool:
+    """True only with the real tennis_atp/ checkout. (A git submodule that was
+    not initialised — e.g. on Streamlit Cloud — still exists as an EMPTY dir,
+    so os.path.isdir is not enough.)"""
+    return os.path.exists(os.path.join(data_dir, "atp_rankings_current.csv"))
+
+
 def resolve_out_dir(out_dir: Optional[str]) -> str:
     """Prefer the production refit (models_v2_final, trained through 2025 —
     see train_v2.train_final) over the benchmark artifacts (models_v2,

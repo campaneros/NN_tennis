@@ -18,7 +18,8 @@ import pandas as pd
 import streamlit as st
 
 PY = sys.executable
-LOCAL = os.path.isdir("tennis_atp")
+from predict_v2 import has_raw_data
+LOCAL = has_raw_data()
 st.set_page_config(page_title="NN tennis v2", layout="wide")
 action = st.sidebar.radio("Action", ["Predict match", "Tournament", "Rank bracket (top-N ATP)", "Train"])
 if not LOCAL:

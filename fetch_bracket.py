@@ -166,7 +166,8 @@ def load_full_names_and_last_active(data_dir: str = "tennis_atp"):
     """(name_index, full_names, last_active). From deploy/state.pkl when the
     raw data isn't there (Streamlit Cloud), else from tennis_atp/ CSVs."""
     import os, pickle
-    if not os.path.isdir(data_dir) and os.path.exists("deploy/state.pkl"):
+    from predict_v2 import has_raw_data
+    if not has_raw_data(data_dir) and os.path.exists("deploy/state.pkl"):
         snap = pickle.load(open("deploy/state.pkl", "rb"))
         return snap["name_index"], snap["full_names"], snap["last_active"]
     import glob

@@ -105,8 +105,8 @@ def main():
     ap.add_argument("--data-dir", type=str, default="tennis_atp")
     ap.add_argument("--out", type=str, required=True)
     args = ap.parse_args()
-    import os
-    ranking, name_index = (ranking_from_csv(args.data_dir) if os.path.isdir(args.data_dir)
+    from predict_v2 import has_raw_data
+    ranking, name_index = (ranking_from_csv(args.data_dir) if has_raw_data(args.data_dir)
                            else ranking_from_snapshot())
     bracket = build_rank_bracket(ranking, args.top_n, [s.strip() for s in args.exclude.split(",") if s.strip()],
                                  name_index, args.surface, args.best_of, args.slam)
