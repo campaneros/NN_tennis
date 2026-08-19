@@ -1,9 +1,7 @@
-*Claude*
-*CLAUDE*
-CLAUDE.md
-*.pt
-*.json
-*.pkl
-*.png
-*.csv
+__pycache__/
+.DS_Store
+atp_matches_pretrain.csv
+eval_out/
+*.log
 *.md
+.claude/

@@ -101,6 +101,24 @@ def temporal_split(df: pd.DataFrame):
     return tr, va, ca, te
 
 
+def swap_sides(df: pd.DataFrame) -> pd.DataFrame:
+    """Mirror every row: p1<->p2, h2h diffs negated, label flipped. Used as
+    training-time augmentation so the network is TAUGHT the known
+    invariance P(p1 wins | swap) = 1 - P(p1 wins) instead of having to
+    discover it from randomized side assignment alone; doubles the data
+    and acts as a strong structural regularizer on the embedding table."""
+    out = df.copy()
+    for c in df.columns:
+        if c.startswith("p1_"):
+            out[c], out["p2_" + c[3:]] = df["p2_" + c[3:]].values, df[c].values
+    for c in ("h2h_diff_p1", "h2h_surf_diff_p1"):
+        if c in out:
+            out[c] = -df[c]
+    if "y" in out:
+        out["y"] = 1 - df["y"]
+    return out
+
+
 # ── PLAYER VOCABULARY (fit on train split ONLY — never on val/calib/test) ──
 
 def build_player_vocab(df_train: pd.DataFrame) -> Dict[int, int]:
@@ -161,7 +179,7 @@ def platt_apply(lr: LogisticRegression, p_raw: np.ndarray) -> np.ndarray:
 
 def choose_calibration(y_val: np.ndarray, p_val_raw: np.ndarray,
                         iso: "IsotonicRegression", platt: LogisticRegression) -> str:
-    """Pick raw / isotonic / platt by ECE on the VALIDATION fold — not the
+    """Pick raw / isotonic / platt by log-loss on the VALIDATION fold — not the
     calib fold the calibrators were fit on (that would be circular: a
     calibrator fit on calib is trivially "best" on calib), and not the test
     fold (that would leak the model-selection decision into the number
@@ -173,8 +191,14 @@ def choose_calibration(y_val: np.ndarray, p_val_raw: np.ndarray,
         "isotonic": iso.transform(p_val_raw),
         "platt": platt_apply(platt, p_val_raw),
     }
-    eces = {name: expected_calibration_error(y_val, p) for name, p in candidates.items()}
-    return min(eces, key=eces.get)
+    # Selection criterion: validation LOG-LOSS, not ECE. ECE on a ~3K-row
+    # fold is a 10-bin histogram statistic with sampling noise of the same
+    # order as the differences between candidates (seed-to-seed test ECE of
+    # one fixed model ranged 0.011-0.036); log-loss is a strictly proper
+    # scoring rule that rewards calibration AND sharpness and is far less
+    # noisy, so it picks the candidate that actually generalizes.
+    scores = {name: log_loss(y_val, np.clip(p, 1e-6, 1 - 1e-6)) for name, p in candidates.items()}
+    return min(scores, key=scores.get)
 
 
 def apply_calibration(method: str, p_raw: np.ndarray, iso: "IsotonicRegression",
@@ -214,10 +238,24 @@ class TennisEmbeddingNet(nn.Module):
     """
 
     def __init__(self, n_players: int, num_dim: int, emb_dim: int = 24,
-                 hidden: Tuple[int, int] = (96, 48), dropout: float = 0.35):
+                 hidden: Tuple[int, int] = (96, 48), dropout: float = 0.35,
+                 player_dropout: float = 0.0):
         super().__init__()
         self.emb_dim = emb_dim
-        self.player_emb = nn.Embedding(n_players + 1, emb_dim, padding_idx=OOV_IDX)
+        # player_dropout: during training, replace a player's id with OOV
+        # with this probability ("word dropout"). Forces the trunk to stay
+        # good on numeric features alone (the OOV/cold-start path seen by
+        # 41% of test matches) and stops the embedding table from
+        # memorizing individual players, which is the overfitting mode
+        # observed in the val-loss curve.
+        self.player_dropout = player_dropout
+        # emb_dim=0 disables the identity embedding entirely (the trunk then
+        # sees only the walk-forward numeric features). This is the shipped
+        # default since v2.3: out-of-time, the embedding table memorizes
+        # past player form that Elo/rolling features already carry
+        # walk-forward, and overfits after 1-2 epochs (MODEL_V2_REPORT.md
+        # sect. 9). Kept as an option (emb_dim>0) for experimentation.
+        self.player_emb = nn.Embedding(n_players + 1, max(emb_dim, 1), padding_idx=OOV_IDX)
         nn.init.normal_(self.player_emb.weight, std=0.05)
         with torch.no_grad():
             self.player_emb.weight[OOV_IDX].zero_()
@@ -230,6 +268,11 @@ class TennisEmbeddingNet(nn.Module):
         )
 
     def forward(self, p1_idx: torch.Tensor, p2_idx: torch.Tensor, x_num: torch.Tensor) -> torch.Tensor:
+        if self.emb_dim == 0:
+            return self.trunk(x_num).squeeze(-1)
+        if self.training and self.player_dropout > 0:
+            keep = lambda idx: idx * (torch.rand_like(idx, dtype=torch.float32) >= self.player_dropout).long()
+            p1_idx, p2_idx = keep(p1_idx), keep(p2_idx)
         e1 = self.player_emb(p1_idx)
         e2 = self.player_emb(p2_idx)
         h = torch.cat([e1 - e2, e1 + e2, x_num], dim=-1)
