@@ -210,6 +210,18 @@ class PlayerStateTracker:
         self.form_stats: Dict[int, deque] = defaultdict(lambda: deque(maxlen=STAT_WINDOW))
         self.last_known_bio: Dict[int, dict] = {}   # most recent rank/points/age/ht/hand seen for a player
 
+    # Pickle support: defaultdicts with lambda factories don't pickle, so
+    # freeze to plain dicts on save and re-wrap on load. Lets export_state.py
+    # ship the fully-replayed state as one small file for the Streamlit
+    # deployment (no tennis_atp/ replay needed at app start).
+    def __getstate__(self):
+        return {k: dict(v) for k, v in self.__dict__.items()}
+
+    def __setstate__(self, st):
+        self.__init__()
+        for k, v in st.items():
+            getattr(self, k).update(v)
+
     def snapshot(self, pid: int, surface: str, date: int) -> dict:
         rec = self.recent_all[pid]
         rec_s = self.recent_surf[(pid, surface)]

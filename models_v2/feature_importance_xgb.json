@@ -1,0 +1,22 @@
+{
+  "elo_diff": 653.3743286132812,
+  "elo_blend_diff": 228.8982696533203,
+  "elo_surf_diff": 164.70310974121094,
+  "rank_log_diff": 50.79700469970703,
+  "age_diff": 40.40643310546875,
+  "rest_days_diff": 32.84984588623047,
+  "matches_surf_diff": 30.0715389251709,
+  "rank_points_log_diff": 27.54030990600586,
+  "is_bo5": 27.337566375732422,
+  "ht_diff": 24.004776000976562,
+  "winrate_recent_surf_diff": 23.620967864990234,
+  "experience_diff": 22.033639907836914,
+  "form_sv_pts_won_pct_diff": 20.179161071777344,
+  "winrate_recent_diff": 18.156978607177734,
+  "p2_elo": 16.933177947998047,
+  "p1_elo": 15.764991760253906,
+  "surface_Grass": 14.77499771118164,
+  "form_2nd_won_pct_diff": 14.15921688079834,
+  "is_slam": 13.915740013122559,
+  "surface_Clay": 13.043726921081543
+}

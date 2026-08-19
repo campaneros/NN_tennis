@@ -1,0 +1,9 @@
+{
+  "mode": "final_production_refit_two_stage",
+  "stage1_train_n": 193747,
+  "stage1_val_n": 1172,
+  "stage1_select_n": 1169,
+  "stage1_best_epoch": 17,
+  "stage2_train_n": 196088,
+  "note": "stage 2 trains on ALL data for the stage-1-discovered epoch count; no blind test fold \u2014 performance estimates come from the benchmark protocol run"
+}

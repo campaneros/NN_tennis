@@ -63,69 +63,56 @@ def next_pow2(n: int) -> int:
     return p
 
 
+def build_rank_bracket(ranking, top_n, exclude, name_index, surface, best_of, slam):
+    """ranking: list of (rank, pid, name) sorted by rank. exclude: list of names."""
+    ex = set()
+    for raw in exclude:
+        pid = resolve_player(raw, name_index)
+        if pid is None:
+            print(f"WARNING: --exclude name '{raw}' did not resolve — ignored.", file=sys.stderr)
+        else:
+            ex.add(pid)
+    size = next_pow2(top_n)
+    picked = [(pid, name) for _, pid, name in ranking if pid not in ex][:size]
+    if len(picked) < size:
+        raise SystemExit(f"Only {len(picked)} eligible ranked players, need {size}.")
+    if size != top_n:
+        print(f"top-n {top_n} padded to {size} with: {', '.join(n for _, n in picked[top_n:])}", file=sys.stderr)
+    players = [picked[s - 1][1] for s in seed_order(size)]
+    return {"surface": surface, "best_of": best_of, "is_slam": bool(slam), "players": players, "results_so_far": []}
+
+
+def ranking_from_snapshot():
+    import pickle
+    snap = pickle.load(open("deploy/state.pkl", "rb"))
+    return snap["ranking"], snap["name_index"]
+
+
+def ranking_from_csv(data_dir):
+    name_index, full_names, _ = load_full_names_and_last_active(data_dir)
+    d = latest_ranking(data_dir)
+    return [(int(r["rank"]), int(r.player), full_names[int(r.player)]) for _, r in d.iterrows()
+            if int(r.player) in full_names], name_index
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--top-n", type=int, required=True, help="how many ranked players to include")
-    ap.add_argument("--exclude", type=str, default="", help="comma-separated player names to leave out (withdrawals)")
+    ap.add_argument("--top-n", type=int, required=True)
+    ap.add_argument("--exclude", type=str, default="", help="comma-separated names to leave out (withdrawals)")
     ap.add_argument("--surface", type=str, default="Hard")
     ap.add_argument("--best-of", type=int, default=3)
-    ap.add_argument("--slam", action="store_true", help="set is_slam=true")
+    ap.add_argument("--slam", action="store_true")
     ap.add_argument("--data-dir", type=str, default="tennis_atp")
     ap.add_argument("--out", type=str, required=True)
     args = ap.parse_args()
-
-    name_index, full_names, last_active = load_full_names_and_last_active(args.data_dir)
-
-    exclude_ids = set()
-    for raw in [s.strip() for s in args.exclude.split(",") if s.strip()]:
-        pid = resolve_player(raw, name_index)
-        if pid is None:
-            print(f"WARNING: --exclude name '{raw}' did not resolve to any ATP player — ignored.",
-                  file=sys.stderr)
-        else:
-            print(f"Excluding {full_names.get(pid, raw)} (requested via --exclude)", file=sys.stderr)
-            exclude_ids.add(pid)
-
-    ranking = latest_ranking(args.data_dir)
-    field_size = next_pow2(args.top_n)
-    if field_size != args.top_n:
-        print(f"--top-n {args.top_n} is not a power of 2 — padding to {field_size} with the "
-              f"next best-ranked available players (single-elimination needs a power-of-2 field).",
-              file=sys.stderr)
-
-    picked: List[int] = []
-    padded_in = []
-    for _, row in ranking.iterrows():
-        if len(picked) >= field_size:
-            break
-        pid = int(row["player"])
-        if pid in exclude_ids or pid in picked:
-            continue
-        if pid not in full_names:
-            continue  # ranking row with no matches in atp_matches_*.csv (shouldn't normally happen)
-        if len(picked) >= args.top_n:
-            padded_in.append(full_names[pid])
-        picked.append(pid)
-
-    if len(picked) < field_size:
-        raise SystemExit(f"Only found {len(picked)} eligible ranked players, need {field_size}. "
-                          f"Check --exclude spelling or --top-n value.")
-    if padded_in:
-        print(f"Padded slots filled by (in rank order): {', '.join(padded_in)}", file=sys.stderr)
-
-    seeds = seed_order(field_size)  # seeds[i] = seed number (1=best) placed at bracket slot i
-    players = [full_names[picked[seed - 1]] for seed in seeds]
-
-    bracket = {
-        "surface": args.surface,
-        "best_of": args.best_of,
-        "is_slam": bool(args.slam),
-        "players": players,
-        "results_so_far": [],
-    }
+    import os
+    ranking, name_index = (ranking_from_csv(args.data_dir) if os.path.isdir(args.data_dir)
+                           else ranking_from_snapshot())
+    bracket = build_rank_bracket(ranking, args.top_n, [s.strip() for s in args.exclude.split(",") if s.strip()],
+                                 name_index, args.surface, args.best_of, args.slam)
     with open(args.out, "w") as f:
         json.dump(bracket, f, indent=2, ensure_ascii=False)
-    print(f"Saved -> {args.out} ({len(players)} players, seed 1 = {players[0]})", file=sys.stderr)
+    print(f"Saved -> {args.out} ({len(bracket['players'])} players, seed 1 = {bracket['players'][0]})", file=sys.stderr)
 
 
 if __name__ == "__main__":

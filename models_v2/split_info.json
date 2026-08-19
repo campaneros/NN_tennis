@@ -1,0 +1,10 @@
+{
+  "train_n": 183049,
+  "val_n": 2917,
+  "calib_n": 2933,
+  "test_n": 7189,
+  "train_end": "2022-01-01",
+  "val_end": "2023-01-01",
+  "calib_end": "2024-01-01",
+  "test_oov_player_rate": 0.4077062178328001
+}

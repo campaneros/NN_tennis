@@ -45,6 +45,7 @@ from model_v2 import (
 )
 
 _CACHE: Dict[str, object] = {}
+STATE_SNAPSHOT = "deploy/state.pkl"  # written by export_state.py
 
 
 def resolve_out_dir(out_dir: Optional[str]) -> str:
@@ -107,10 +108,19 @@ def load_state(data_dir: str, out_dir: Optional[str] = None):
         return _CACHE
 
     out_dir = resolve_out_dir(out_dir)
-    print("Replaying full match history to build current player state (one-time)...", file=sys.stderr)
-    df_raw = load_raw_atp(data_dir)
-    _, tracker = build_pretrain_table(df_raw)
-    name_index = build_name_index(data_dir)
+    if os.path.exists(STATE_SNAPSHOT):
+        # Pre-replayed state exported by export_state.py (Streamlit deploy path:
+        # no tennis_atp/ data and no 90 s replay needed — loads in <1 s).
+        with open(STATE_SNAPSHOT, "rb") as f:
+            snap = pickle.load(f)
+        tracker, name_index, last_date = snap["tracker"], snap["name_index"], snap["last_date"]
+        print(f"Loaded player state snapshot {STATE_SNAPSHOT} (data through {last_date})", file=sys.stderr)
+    else:
+        print("Replaying full match history to build current player state (one-time)...", file=sys.stderr)
+        df_raw = load_raw_atp(data_dir)
+        _, tracker = build_pretrain_table(df_raw)
+        name_index = build_name_index(data_dir)
+        last_date = int(df_raw["tourney_date"].max())
 
     with open(f"{out_dir}/preprocessing.pkl", "rb") as f:
         prep_art = pickle.load(f)
@@ -121,7 +131,7 @@ def load_state(data_dir: str, out_dir: Optional[str] = None):
 
     _CACHE.update(dict(
         tracker=tracker, name_index=name_index, prep_art=prep_art,
-        vocab=vocab, net=net, last_date=int(df_raw["tourney_date"].max()),
+        vocab=vocab, net=net, last_date=last_date,
     ))
     return _CACHE
 
