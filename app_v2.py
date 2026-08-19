@@ -49,6 +49,43 @@ def model_dir_picker():
     return st.selectbox("Model artifacts", dirs) if dirs else None
 
 
+def match_player(query, players):
+    """Tolerant lookup of a typed name inside a bracket.
+    -> ("ok", name) | ("choose", [candidates]) | ("none", [suggestions])"""
+    import difflib, unicodedata
+    norm = lambda s: unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode().lower().replace("-", " ")
+    q = norm(query).split()
+    if not q:
+        return "none", []
+    exact = [p for p in players if norm(p) == " ".join(q)]
+    if exact:
+        return "ok", exact[0]
+    # every typed token is a whole token of the player's name (surname only, first name only, ...)
+    tok = [p for p in players if set(q) <= set(norm(p).split())]
+    if len(tok) == 1:
+        return "ok", tok[0]
+    if len(tok) > 1:
+        return "choose", tok
+    # typo: closest names by string similarity
+    by_name = {norm(p): p for p in players}
+    close = difflib.get_close_matches(" ".join(q), list(by_name), n=3, cutoff=0.5)
+    sugg = [by_name[c] for c in close]
+    # also try surname-only similarity (typo in the surname)
+    for p in players:
+        if p not in sugg and difflib.SequenceMatcher(None, q[-1], norm(p).split()[-1]).ratio() >= 0.7:
+            sugg.append(p)
+    return "none", sugg[:4]
+
+
+def parse_odds_line(line):
+    """'Sinner 1.9' / 'Jannik Sinner, 1.90' / 'sinner @1.9' -> (name, odds) or None."""
+    import re
+    m = re.search(r"[@,;:\s]*([0-9]+(?:[.,][0-9]+)?)\s*$", line)
+    if not m or not line[:m.start()].strip():
+        return None
+    return line[:m.start()].strip(" ,;:@"), float(m.group(1).replace(",", "."))
+
+
 def verdict_box(txt, label):
     verdict = txt.split("=> ")[-1].split(":")[0]
     {"VALUE BET": st.success, "MARGINAL": st.warning}.get(verdict, st.error)(f"{label}: **{verdict}**")
@@ -162,7 +199,30 @@ elif action == "Tournament":
     sims = st.slider("Simulations", 1000, 50000, 10000, 1000)
     n_mc_model = st.slider("MC-dropout samples per pair", 5, 100, 30, 5)
     odds_txt = st.text_area("Outright (title) odds — optional, one per line: `Player name, decimal odds`",
-                            placeholder="Jannik Sinner, 1.90\nAlexander Zverev, 6.5", height=90)
+                            placeholder="Jannik Sinner, 1.90\nZverev 6.5", height=90)
+    outright = []   # [(player name in bracket, odds)] resolved interactively below
+    if cfg and odds_txt.strip():
+        for k, line in enumerate(l for l in odds_txt.splitlines() if l.strip()):
+            parsed = parse_odds_line(line)
+            if not parsed:
+                st.warning(f"Line {k+1}: could not find the odds in {line!r} — write `Name, 1.90` (or `Name 1.90`)"); continue
+            nm, od = parsed
+            status, res = match_player(nm, cfg["players"])
+            if status == "ok":
+                outright.append((res, od))
+                if res.lower() != nm.lower():
+                    st.caption(f"Line {k+1}: '{nm}' → **{res}** @ {od:.2f}")
+            elif status == "choose":
+                pick = st.selectbox(f"Line {k+1}: '{nm}' matches several players — which one?", ["(skip)"] + res, key=f"odds_pick_{k}")
+                if pick != "(skip)":
+                    outright.append((pick, od))
+            else:
+                if res:
+                    pick = st.selectbox(f"Line {k+1}: '{nm}' not in this bracket — did you mean:", ["(skip)"] + res, key=f"odds_sugg_{k}")
+                    if pick != "(skip)":
+                        outright.append((pick, od))
+                else:
+                    st.warning(f"Line {k+1}: '{nm}' not in this bracket and no similar name found")
     out_dir = model_dir_picker()
     if cfg and st.button("Run"):
         s = state(out_dir)
@@ -183,19 +243,11 @@ elif action == "Tournament":
                 xerr=[(tp - ci[:, 0])[::-1], (ci[:, 1] - tp)[::-1]], capsize=4)
         ax.set_xlabel("P(title)  ±90% CI"); ax.set_title("Top 15 title probabilities")
         st.pyplot(fig)
-        for line in [l for l in odds_txt.splitlines() if l.strip()]:
-            try:
-                nm, od = [x.strip() for x in line.rsplit(",", 1)]; od = float(od)
-            except ValueError:
-                st.warning(f"Could not parse {line!r} (expected `Name, odds`)"); continue
-            idx = next((i for i, p in enumerate(players) if p.lower() == nm.lower()), None)
-            if idx is None:
-                pid = resolve_player(nm, s["name_index"]); idx = next((i for i, q in enumerate(pids) if q is not None and q == pid), None)
-            if idx is None:
-                st.warning(f"'{nm}' is not in this bracket"); continue
-            verdict_box(value_bet_analysis(f"{players[idx]} (title)", float(sim["title_prob"][idx]),
+        for nm, od in outright:
+            idx = players.index(nm)
+            verdict_box(value_bet_analysis(f"{nm} (title)", float(sim["title_prob"][idx]),
                                            tuple(map(float, sim["title_ci90"][idx])), od),
-                        f"{players[idx]} to win the title @ {od:.2f}")
+                        f"{nm} to win the title @ {od:.2f}")
         n_r = sim["n_rounds"]
         df = pd.DataFrame(sim["reach_prob"][:, 1:], index=players, columns=[f"R{r}" for r in range(1, n_r)] + ["Title"])
         st.dataframe(df.sort_values("Title", ascending=False).style.format("{:.3f}"), height=500)
