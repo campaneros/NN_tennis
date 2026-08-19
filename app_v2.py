@@ -21,7 +21,7 @@ PY = sys.executable
 from predict_v2 import has_raw_data
 LOCAL = has_raw_data()
 st.set_page_config(page_title="NN tennis v2", layout="wide")
-action = st.sidebar.radio("Action", ["Predict match", "Tournament", "Rank bracket (top-N ATP)", "Train"])
+action = st.sidebar.radio("Action", ["Predict match", "Tournament", "Rank bracket (top-N ATP)"] + (["Train"] if LOCAL else []))
 if not LOCAL:
     st.sidebar.caption("Cloud mode: pre-computed player state (deploy/state.pkl); training runs locally only.")
 
@@ -205,9 +205,7 @@ elif action == "Train":
     data = st.text_input("Data CSV", "atp_matches_pretrain.csv")
     final = st.checkbox("Production refit (--final, all data)")
     out_dir = st.text_input("Out dir", "models_v2_final" if final else "models_v2")
-    if not LOCAL:
-        st.info("Training needs the full dataset — run `train_v2.py` locally, then `export_state.py`, commit, push.")
-    elif st.button("Run training"):
+    if st.button("Run training"):
         rc = run_cmd(["train_v2.py", "--data", data, "--out-dir", out_dir] + (["--final"] if final else []))
         st.success("Done") if rc == 0 else st.error(f"Exit {rc}")
     st.divider()
