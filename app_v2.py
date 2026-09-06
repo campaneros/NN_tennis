@@ -111,6 +111,94 @@ def pick_player_ui(label, typed, s, key):
     return None
 
 
+@st.cache_resource(show_spinner=False)
+def live_maps(_s_key="v1"):
+    """(fid->atp_pid, atp_pid->fid, season stats df, season W-L dict) from data_updated/."""
+    from live_data import build_id_map, load_live, season_record, season_stats
+    from predict_v2 import load_state
+    s = load_state("tennis_atp")
+    df = load_live()
+    idmap = build_id_map(df, s["name_index"], s["full_names"], s["last_active"])
+    return idmap, {v: k for k, v in idmap.items() if v}, season_stats(), season_record()
+
+
+@st.cache_data(show_spinner=False)
+def _season_minutes_local(season_start: int):
+    import glob
+    out = {}
+    for fp in glob.glob("tennis_atp/atp_matches_*.csv"):
+        try:
+            d = pd.read_csv(fp, usecols=["tourney_date", "tourney_name", "winner_id", "loser_id", "minutes"], low_memory=False)
+        except ValueError:
+            continue  # doubles/futures files have a different schema
+        d = d[(d.tourney_date >= season_start) & d.minutes.notna()]
+        for r in d.itertuples():
+            for pid in (int(r.winner_id), int(r.loser_id)):
+                out.setdefault(pid, []).append((int(r.tourney_date), float(r.minutes), str(r.tourney_name)))
+    return out
+
+
+def time_on_court(pid, s):
+    season_start = int(str(s["last_date"])[:4] + "0101")
+    mm = s.get("minutes") if s.get("minutes") else (_season_minutes_local(season_start) if LOCAL else {})
+    rows = sorted(mm.get(pid, []))
+    if not rows:
+        return None
+    fmt = lambda m: f"{int(m//60)}h {int(m%60)}m"
+    tot = sum(m for _, m, _ in rows); last10 = [m for _, m, _ in rows[-10:]]
+    per_t = {}
+    for _, m, t in rows:
+        per_t.setdefault(t, []).append(m)
+    df = pd.DataFrame([(t, fmt(sum(v)), fmt(sum(v)/len(v))) for t, v in per_t.items()],
+                      columns=["tournament", "total", "avg/match"]).set_index("tournament")
+    return dict(n=len(rows), total=fmt(tot), avg=fmt(tot/len(rows)), avg10=fmt(sum(last10)/len(last10)), per_t=df)
+
+
+def stats_and_h2h_panel(pid_h, pid_a, nm_h, nm_a, s, surface):
+    """tennisdata-style comparison: season serve/return stats, Elo/form, H2H meetings list."""
+    from live_data import STAT_COLS, h2h_list
+    idmap, rev, sstats, srec = live_maps()
+    fid_h, fid_a = rev.get(pid_h), rev.get(pid_a)
+    tr = s["tracker"]
+    sn_h, sn_a = tr.snapshot(pid_h, surface, s["last_date"]), tr.snapshot(pid_a, surface, s["last_date"])
+    bio_h, bio_a = tr.bio(pid_h), tr.bio(pid_a)
+    rows = []
+    def add(label, vh, va, fmt="{:.0f}"):
+        rows.append((label, "—" if vh != vh or vh is None else fmt.format(vh),
+                            "—" if va != va or va is None else fmt.format(va)))
+    add("ATP rank", bio_h["rank"], bio_a["rank"])
+    rec_h = srec.get(fid_h, (0, 0)); rec_a = srec.get(fid_a, (0, 0))
+    rows.append(("Season W-L", f"{rec_h[0]}-{rec_h[1]}", f"{rec_a[0]}-{rec_a[1]}"))
+    add("Season win %", 100*rec_h[0]/max(1, sum(rec_h)), 100*rec_a[0]/max(1, sum(rec_a)), "{:.0f}%")
+    add("Elo (career)", sn_h["elo"], sn_a["elo"])
+    add(f"Elo ({surface})", sn_h["elo_surf"], sn_a["elo_surf"])
+    add("Last-50 win %", 100*sn_h["winrate_recent"], 100*sn_a["winrate_recent"], "{:.0f}%")
+    if fid_h in getattr(sstats, "index", []) and fid_a in sstats.index:
+        for c, label in STAT_COLS.items():
+            fmt = "{:.1f}" if "avg" in label else "{:.0f}%"
+            add(label + " (season)", sstats.loc[fid_h, c], sstats.loc[fid_a, c], fmt)
+    st.dataframe(pd.DataFrame(rows, columns=["", nm_h, nm_a]).set_index(""), use_container_width=True)
+    h2h = tr.h2h_diff(pid_h, pid_a)
+    st.caption(f"H2H (all ATP history): {'+' + str(h2h) + ' ' + nm_h.split()[-1] if h2h > 0 else ('+' + str(-h2h) + ' ' + nm_a.split()[-1] if h2h < 0 else 'even')} "
+               f"· on {surface}: {tr.h2h_surf_diff(pid_h, pid_a, surface):+d}")
+    tc1, tc2 = st.columns(2)
+    for col, pid, nm in ((tc1, pid_h, nm_h), (tc2, pid_a, nm_a)):
+        t = time_on_court(pid, s)
+        if t:
+            col.markdown(f"**Time on court — {nm}** (season, {t['n']} matches, data through the ATP archive cutoff)")
+            col.write(f"Total {t['total']} · avg {t['avg']}/match · last-10 avg {t['avg10']}")
+            with col.expander("per tournament"):
+                st.dataframe(t["per_t"], use_container_width=True)
+    if fid_h and fid_a:
+        m = h2h_list(fid_h, fid_a)
+        if len(m):
+            t = m[["date_human", "tournament", "home_name", "away_name", "home_set_score", "away_set_score",
+                   "home_aces", "away_aces", "home_double_faults", "away_double_faults"]].copy()
+            t.columns = ["date", "tournament", "home", "away", "sets H", "sets A", "aces H", "aces A", "DF H", "DF A"]
+            st.markdown("**Head-to-head meetings (since 2021)**")
+            st.dataframe(t.set_index("date"), use_container_width=True)
+
+
 def verdict_box(txt, label):
     verdict = txt.split("=> ")[-1].split(":")[0]
     {"VALUE BET": st.success, "MARGINAL": st.warning}.get(verdict, st.error)(f"{label}: **{verdict}**")
@@ -123,6 +211,9 @@ if action == "Upcoming matches":
     out_dir = model_dir_picker()
     n_mc = st.sidebar.slider("MC-dropout samples", 20, 300, 100, 20)
     s = state(out_dir)
+    if not s.get("full_names"):   # older snapshot without names: rebuild from whatever source exists
+        from fetch_bracket import load_full_names_and_last_active
+        _, s["full_names"], s["last_active"] = load_full_names_and_last_active("tennis_atp")
     from live_data import season_record, upcoming
     SEASON = season_record()
     up = upcoming(s["name_index"], s["full_names"], s["last_active"])
@@ -176,6 +267,8 @@ if action == "Upcoming matches":
                             {"VALUE BET": st.success, "MARGINAL": st.warning}[verdict](f"{nm} @ {od:.2f}: **{verdict}**")
                             with st.expander("details"):
                                 st.code(txt)
+                with st.expander("Player stats & head-to-head"):
+                    stats_and_h2h_panel(int(r.home_pid), int(r.away_pid), r.home_atp_name, r.away_atp_name, s, r.surface_norm)
 
 # ---------------------------------------------------------------- Predict
 elif action == "Predict match":
@@ -227,6 +320,9 @@ elif action == "Predict match":
             (st.success if "BET" in plan and "NO BET" not in plan else st.info)(
                 "\n".join(l.strip() for l in plan.splitlines() if l.strip().startswith(("=>", "ARB"))))
             st.code(plan)
+        if HAS_LIVE:
+            with st.expander("Player stats & head-to-head", expanded=True):
+                stats_and_h2h_panel(pid1, pid2, p1, p2, s, surface)
 
 # ---------------------------------------------------------------- Tournament
 elif action == "Tournament":

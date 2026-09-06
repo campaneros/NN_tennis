@@ -95,6 +95,35 @@ def season_record(live_dir: str = "data_updated") -> Dict[int, "tuple[int, int]"
     return {k: (v[0], v[1]) for k, v in rec.items()}
 
 
+STAT_COLS = {"aces": "Aces (avg/match)", "double_faults": "Double faults (avg/match)",
+             "service_points_won_perc": "Service points won %", "return_points_won_perc": "Return points won %",
+             "break_points_won_perc": "Break points converted %", "break_points_saved_perc": "Break points saved %"}
+
+
+def season_stats(live_dir: str = "data_updated") -> "pd.DataFrame":
+    """Per-player current-season averages of the in-match stats (fid-indexed)."""
+    df = load_live(live_dir)
+    if df.empty:
+        return pd.DataFrame()
+    df = df[(df.season_year == df.season_year.max()) & (df.status == "FINISHED")]
+    parts = []
+    for side in ("home", "away"):
+        cols = {f"{side}_{c}": c for c in STAT_COLS}
+        p = df[[f"{side}_id"] + list(cols)].rename(columns={f"{side}_id": "fid", **cols})
+        parts.append(p)
+    return pd.concat(parts).groupby("fid").mean(numeric_only=True)
+
+
+def h2h_list(fid1: int, fid2: int, live_dir: str = "data_updated") -> "pd.DataFrame":
+    """All FINISHED meetings between the two (any season in the folder), newest first."""
+    df = load_live(live_dir)
+    if df.empty:
+        return df
+    m = df[(df.status == "FINISHED") &
+           (((df.home_id == fid1) & (df.away_id == fid2)) | ((df.home_id == fid2) & (df.away_id == fid1)))]
+    return m.sort_values("date_timestamp", ascending=False)
+
+
 def upcoming(name_index, full_names, last_active, live_dir: str = "data_updated",
              tour_only: bool = True) -> pd.DataFrame:
     """SCHEDULED matches with resolved ATP names + odds, soonest first."""

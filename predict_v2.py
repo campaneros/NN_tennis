@@ -123,6 +123,7 @@ def load_state(data_dir: str, out_dir: Optional[str] = None):
         tracker, name_index, last_date = snap["tracker"], snap["name_index"], snap["last_date"]
         _CACHE["last_active"] = snap.get("last_active", {})
         _CACHE["full_names"] = snap.get("full_names", {})
+        _CACHE["minutes"] = snap.get("minutes", {})
         print(f"Loaded player state snapshot {STATE_SNAPSHOT} (data through {last_date})", file=sys.stderr)
     else:
         print("Replaying full match history to build current player state (one-time)...", file=sys.stderr)

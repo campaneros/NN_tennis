@@ -20,6 +20,18 @@ r = pd.read_csv(f"{data_dir}/atp_rankings_current.csv")
 r = r[r.ranking_date == r.ranking_date.max()].sort_values("rank").head(300)
 ranking = [(int(row["rank"]), int(row.player), full_name.get(int(row.player), "?"))
            for _, row in r.iterrows() if int(row.player) in full_name]
+import glob
+season_start = int(str(df_raw.tourney_date.max())[:4] + "0101")
+minutes = {}
+for fp in glob.glob(f"{data_dir}/atp_matches_*.csv"):
+    try:
+        d = pd.read_csv(fp, usecols=["tourney_date", "tourney_name", "winner_id", "loser_id", "minutes"], low_memory=False)
+    except ValueError:
+        continue  # doubles/futures files have a different schema
+    d = d[(d.tourney_date >= season_start) & d.minutes.notna()]
+    for row in d.itertuples():
+        for pid in (int(row.winner_id), int(row.loser_id)):
+            minutes.setdefault(pid, []).append((int(row.tourney_date), float(row.minutes), str(row.tourney_name)))
 if os.path.isdir("data_updated"):
     from live_data import extend_tracker
     last = extend_tracker(tracker, int(df_raw.tourney_date.max()), name_index, full_name, last_active)
@@ -29,6 +41,6 @@ os.makedirs("deploy", exist_ok=True)
 with open("deploy/state.pkl", "wb") as f:
     pickle.dump(dict(tracker=tracker, name_index=name_index, last_date=last,
                      ranking=ranking, ranking_date=int(r.ranking_date.max()),
-                     full_names=full_name, last_active=last_active), f)
-print(f"deploy/state.pkl: {os.path.getsize('deploy/state.pkl')/1e6:.1f} MB, data through {df_raw.tourney_date.max()}, "
+                     full_names=full_name, last_active=last_active, minutes=minutes), f)
+print(f"deploy/state.pkl: {os.path.getsize('deploy/state.pkl')/1e6:.1f} MB, data through {last}, "
       f"ranking {r.ranking_date.max()} top {len(ranking)}")
