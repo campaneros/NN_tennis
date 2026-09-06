@@ -21,7 +21,9 @@ PY = sys.executable
 from predict_v2 import has_raw_data
 LOCAL = has_raw_data()
 st.set_page_config(page_title="NN tennis v2", layout="wide")
-action = st.sidebar.radio("Action", ["Predict match", "Tournament", "Rank bracket (top-N ATP)"] + (["Train"] if LOCAL else []))
+HAS_LIVE = os.path.isdir("data_updated")
+action = st.sidebar.radio("Action", (["Upcoming matches"] if HAS_LIVE else []) +
+                          ["Predict match", "Tournament", "Rank bracket (top-N ATP)"] + (["Train"] if LOCAL else []))
 if not LOCAL:
     st.sidebar.caption("Cloud mode: pre-computed player state (deploy/state.pkl); training runs locally only.")
 
@@ -115,8 +117,68 @@ def verdict_box(txt, label):
     st.code(txt)
 
 
+# ---------------------------------------------------------------- Upcoming cards
+if action == "Upcoming matches":
+    from predict_v2 import predict_match_prob, value_bet_analysis
+    out_dir = model_dir_picker()
+    n_mc = st.sidebar.slider("MC-dropout samples", 20, 300, 100, 20)
+    s = state(out_dir)
+    from live_data import season_record, upcoming
+    SEASON = season_record()
+    up = upcoming(s["name_index"], s["full_names"], s["last_active"])
+    if up.empty:
+        st.info("No scheduled ATP Tour matches in data_updated/.")
+    else:
+        tournaments = list(up.tournament.unique())
+        sel = st.multiselect("Tournaments", tournaments, default=tournaments)
+        up = up[up.tournament.isin(sel)]
+        st.caption(f"{len(up)} scheduled match(es). Model = calibrated NN with state updated through the "
+                   f"latest results in data_updated/; Win% error bars are the 90% MC-dropout interval.")
+        for r in up.itertuples():
+            with st.container(border=True):
+                slam = bool(r.is_slam)
+                bo = 5 if slam else 3
+                head = f"**{r.tournament}** · {r.surface_norm} · Bo{bo}{' · Slam' if slam else ''} · {r.round} · {r.date_human}"
+                st.markdown(head)
+                if r.home_pid is None or r.away_pid is None:
+                    st.warning(f"{r.home_name} vs {r.away_name}: player not in ATP dataset — no prediction")
+                    continue
+                pr = predict_match_prob(int(r.home_pid), int(r.away_pid), r.surface_norm, bo, slam,
+                                        "tennis_atp", out_dir, n_mc)
+                lo, hi = pr["p1_win_ci90"]
+                tr = s["tracker"]
+                sn_h = tr.snapshot(int(r.home_pid), r.surface_norm, s["last_date"])
+                sn_a = tr.snapshot(int(r.away_pid), r.surface_norm, s["last_date"])
+                rec_h = SEASON.get(int(r.home_id), (0, 0)); rec_a = SEASON.get(int(r.away_id), (0, 0))
+                h2h = tr.h2h_diff(int(r.home_pid), int(r.away_pid))
+                c1, c2, c3 = st.columns([3, 2, 3])
+                c1.metric(r.home_atp_name, f"{pr['p1_win_prob']:.0%}", f"±{(hi-lo)/2:.0%} CI", delta_color="off")
+                c1.caption(f"ATP #{int(r.home_rank) if pd.notna(r.home_rank) else '?'} · season {rec_h[0]}-{rec_h[1]} · "
+                           f"Elo {sn_h['elo']:.0f} ({r.surface_norm} {sn_h['elo_surf']:.0f}) · "
+                           f"last-50 win {sn_h['winrate_recent']:.0%}" if sn_h['winrate_recent'] == sn_h['winrate_recent'] else "")
+                c3.metric(r.away_atp_name, f"{pr['p2_win_prob']:.0%}", f"±{(hi-lo)/2:.0%} CI", delta_color="off")
+                c3.caption(f"ATP #{int(r.away_rank) if pd.notna(r.away_rank) else '?'} · season {rec_a[0]}-{rec_a[1]} · "
+                           f"Elo {sn_a['elo']:.0f} ({r.surface_norm} {sn_a['elo_surf']:.0f}) · "
+                           f"last-50 win {sn_a['winrate_recent']:.0%}" if sn_a['winrate_recent'] == sn_a['winrate_recent'] else "")
+                if h2h:
+                    c2.markdown(f"<div style='text-align:center'>H2H: <b>{'+' if h2h>0 else ''}{h2h}</b> "
+                                f"{r.home_atp_name.split()[-1] if h2h>0 else r.away_atp_name.split()[-1]}</div>",
+                                unsafe_allow_html=True)
+                oh, oa = r.home_odds_match_winner, r.away_odds_match_winner
+                if pd.notna(oh) and pd.notna(oa):
+                    c2.markdown(f"<div style='text-align:center'>odds<br><b>{oh:.2f}</b> — <b>{oa:.2f}</b><br>"
+                                f"implied {1/oh:.0%} — {1/oa:.0%}</div>", unsafe_allow_html=True)
+                    for nm, p, ci, od in ((r.home_atp_name, pr["p1_win_prob"], (lo, hi), oh),
+                                          (r.away_atp_name, pr["p2_win_prob"], (1-hi, 1-lo), oa)):
+                        txt = value_bet_analysis(nm, p, ci, float(od))
+                        verdict = txt.split("=> ")[-1].split(":")[0]
+                        if verdict != "NO BET":
+                            {"VALUE BET": st.success, "MARGINAL": st.warning}[verdict](f"{nm} @ {od:.2f}: **{verdict}**")
+                            with st.expander("details"):
+                                st.code(txt)
+
 # ---------------------------------------------------------------- Predict
-if action == "Predict match":
+elif action == "Predict match":
     from predict_v2 import predict_match_prob, resolve_player, staking_plan, value_bet_analysis
     c1, c2 = st.columns(2)
     p1 = c1.text_input("Player 1", "Carlos Alcaraz")

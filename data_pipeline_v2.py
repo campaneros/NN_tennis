@@ -152,8 +152,15 @@ def _rolling_mean(dq: deque) -> Dict[str, float]:
     return out
 
 
-def load_raw_atp(data_dir: str) -> pd.DataFrame:
+def load_raw_atp(data_dir: str, include_chall: bool = True) -> pd.DataFrame:
+    """Tour-level files plus (by default) the qual/challenger archive: those
+    matches use the SAME ATP player ids, and walking forward through them
+    keeps Elo/form current for young players who live on the Challenger
+    tour between tour-level appearances (weight 0.55 via ATP_LEVEL_WEIGHTS
+    already discounts them in the Elo update)."""
     files = sorted(_glob.glob(os.path.join(data_dir, "atp_matches_????.csv")))
+    if include_chall:
+        files += sorted(_glob.glob(os.path.join(data_dir, "atp_matches_qual_chall_????.csv")))
     if not files:
         raise RuntimeError(f"No atp_matches_YYYY.csv found in '{data_dir}'.")
     chunks = []

@@ -20,9 +20,14 @@ r = pd.read_csv(f"{data_dir}/atp_rankings_current.csv")
 r = r[r.ranking_date == r.ranking_date.max()].sort_values("rank").head(300)
 ranking = [(int(row["rank"]), int(row.player), full_name.get(int(row.player), "?"))
            for _, row in r.iterrows() if int(row.player) in full_name]
+if os.path.isdir("data_updated"):
+    from live_data import extend_tracker
+    last = extend_tracker(tracker, int(df_raw.tourney_date.max()), name_index, full_name, last_active)
+else:
+    last = int(df_raw.tourney_date.max())
 os.makedirs("deploy", exist_ok=True)
 with open("deploy/state.pkl", "wb") as f:
-    pickle.dump(dict(tracker=tracker, name_index=name_index, last_date=int(df_raw.tourney_date.max()),
+    pickle.dump(dict(tracker=tracker, name_index=name_index, last_date=last,
                      ranking=ranking, ranking_date=int(r.ranking_date.max()),
                      full_names=full_name, last_active=last_active), f)
 print(f"deploy/state.pkl: {os.path.getsize('deploy/state.pkl')/1e6:.1f} MB, data through {df_raw.tourney_date.max()}, "
