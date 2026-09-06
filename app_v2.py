@@ -179,8 +179,10 @@ def stats_and_h2h_panel(pid_h, pid_a, nm_h, nm_a, s, surface):
             add(label + " (season)", sstats.loc[fid_h, c], sstats.loc[fid_a, c], fmt)
     st.dataframe(pd.DataFrame(rows, columns=["", nm_h, nm_a]).set_index(""), use_container_width=True)
     h2h = tr.h2h_diff(pid_h, pid_a)
-    st.caption(f"H2H (all ATP history): {'+' + str(h2h) + ' ' + nm_h.split()[-1] if h2h > 0 else ('+' + str(-h2h) + ' ' + nm_a.split()[-1] if h2h < 0 else 'even')} "
-               f"· on {surface}: {tr.h2h_surf_diff(pid_h, pid_a, surface):+d}")
+    hs = tr.h2h_surf_diff(pid_h, pid_a, surface)
+    fmt_h2h = lambda d: "even" if d == 0 else f"{(nm_h if d > 0 else nm_a).split()[-1]} +{abs(d)}"
+    st.caption(f"H2H (all ATP history): {fmt_h2h(h2h)} · on {surface}: {fmt_h2h(hs)} "
+               f"(wins advantage in direct meetings)")
     tc1, tc2 = st.columns(2)
     for col, pid, nm in ((tc1, pid_h, nm_h), (tc2, pid_a, nm_a)):
         t = time_on_court(pid, s)
@@ -252,8 +254,8 @@ if action == "Upcoming matches":
                            f"Elo {sn_a['elo']:.0f} ({r.surface_norm} {sn_a['elo_surf']:.0f}) · "
                            f"last-50 win {sn_a['winrate_recent']:.0%}" if sn_a['winrate_recent'] == sn_a['winrate_recent'] else "")
                 if h2h:
-                    c2.markdown(f"<div style='text-align:center'>H2H: <b>{'+' if h2h>0 else ''}{h2h}</b> "
-                                f"{r.home_atp_name.split()[-1] if h2h>0 else r.away_atp_name.split()[-1]}</div>",
+                    lead = r.home_atp_name.split()[-1] if h2h > 0 else r.away_atp_name.split()[-1]
+                    c2.markdown(f"<div style='text-align:center'>H2H: <b>{lead} +{abs(h2h)}</b></div>",
                                 unsafe_allow_html=True)
                 oh, oa = r.home_odds_match_winner, r.away_odds_match_winner
                 if pd.notna(oh) and pd.notna(oa):
