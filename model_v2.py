@@ -358,12 +358,16 @@ def embedding_net_predict(model: TennisEmbeddingNet, p1_idx, p2_idx, x_num, devi
 
 @torch.no_grad()
 def embedding_net_mc_predict(model: TennisEmbeddingNet, p1_idx, p2_idx, x_num,
-                              n_samples: int = 200, device: str = "cpu") -> Tuple[np.ndarray, np.ndarray]:
+                              n_samples: int = 200, device: str = "cpu",
+                              seed: int = 42) -> Tuple[np.ndarray, np.ndarray]:
     """Monte-Carlo dropout (Gal & Ghahramani, 2016): keep dropout ACTIVE at
     inference and repeat the forward pass. The spread across samples is an
     approximate epistemic-uncertainty interval — useful for single-match
     prediction (predict_v2.py), where "how confident is this probability
     itself" matters for bet sizing, not just the point estimate."""
+    # Fixed seed: the CI (and thus a VALUE/MARGINAL verdict sitting near the
+    # break-even boundary) must be reproducible across runs and machines.
+    torch.manual_seed(seed)
     model.train()  # keep dropout active; LayerNorm makes batch size 1 safe
     to_t = lambda a, dt: torch.tensor(a, dtype=dt, device=device)
     p1_t, p2_t, x_t = to_t(p1_idx, torch.long), to_t(p2_idx, torch.long), to_t(x_num, torch.float32)

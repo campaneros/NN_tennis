@@ -138,3 +138,135 @@ def upcoming(name_index, full_names, last_active, live_dir: str = "data_updated"
         up[f"{side}_pid"] = up[f"{side}_id"].map(lambda i: idmap.get(int(i)))
         up[f"{side}_atp_name"] = up[f"{side}_pid"].map(lambda p: full_names.get(p) if p else None)
     return up.sort_values("date_timestamp")
+
+
+# ── LIVE source: diretta.it/Flashscore daily feed + per-bookmaker odds ──────
+# (no CSV needed: schedule of today/tomorrow + odds comparison, both from the
+# same feeds the website itself uses; x-fsign is embedded in the public page)
+import json as _json
+import statistics as _stats
+import urllib.request as _rq
+
+import ssl as _ssl
+try:
+    import certifi as _certifi
+    _SSLCTX = _ssl.create_default_context(cafile=_certifi.where())
+except ImportError:
+    _SSLCTX = _ssl.create_default_context()
+
+_UA = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+                     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+       "Referer": "https://www.diretta.it/", "Origin": "https://www.diretta.it"}
+_SURF_IT = {"cemento": "Hard", "terra": "Clay", "erba": "Grass", "sintetico": "Hard"}
+_SLAM_IT = ("us open", "wimbledon", "french open", "roland garros", "australian open")
+_SIGN = {"v": "SW9D1eZo"}
+
+
+def _refresh_sign():
+    import re as _re
+    html = _rq.urlopen(_rq.Request("https://www.diretta.it/tennis/", headers=_UA),
+                       timeout=15, context=_SSLCTX).read().decode("utf-8", "replace")
+    m = _re.search(r'feed_sign":"([A-Za-z0-9]+)"', html)
+    if m:
+        _SIGN["v"] = m.group(1)
+
+
+def _get(url: str, headers: dict, tries: int = 3) -> bytes:
+    import time as _t
+    last = None
+    for i in range(tries):
+        try:
+            return _rq.urlopen(_rq.Request(url, headers=headers), timeout=20, context=_SSLCTX).read()
+        except Exception as e:  # transient RemoteDisconnected/timeouts happen on this CDN
+            last = e
+            _t.sleep(0.8 * (i + 1))
+    raise last
+
+
+def _feed(name: str) -> str:
+    url = f"https://400.flashscore.ninja/400/x/feed/{name}"
+    try:
+        out = _get(url, {**_UA, "x-fsign": _SIGN["v"]}).decode("utf-8", "replace")
+    except Exception:
+        _refresh_sign()   # signature may have rotated: re-scrape it from the public page
+        out = _get(url, {**_UA, "x-fsign": _SIGN["v"]}).decode("utf-8", "replace")
+    if "401 Unauthorized" in out[:400]:
+        _refresh_sign()
+        out = _get(url, {**_UA, "x-fsign": _SIGN["v"]}).decode("utf-8", "replace")
+    return out
+
+
+def diretta_daily(days=(0, 1)) -> pd.DataFrame:
+    """Scheduled ATP-singles TOUR matches for today(+tomorrow) from the daily
+    feed. Columns mirror what the Upcoming cards need."""
+    rows = []
+    for day in days:
+        raw = _feed(f"f_2_{day}_3_it_1")
+        tournament = surface = None
+        is_tour = False
+        for seg in raw.split("~"):
+            d = dict(f.split("÷", 1) for f in seg.split("¬") if "÷" in f)
+            if "ZA" in d:  # section header, e.g. 'ATP - SINGOLARE: US Open (USA), cemento'
+                hdr = d["ZA"]
+                is_tour = hdr.startswith("ATP - SINGOLARE:") and "qualificazione" not in hdr.lower()
+                if is_tour:
+                    body = hdr.split(":", 1)[1].strip()
+                    tournament = body.split("(")[0].strip()
+                    surface = next((v for k, v in _SURF_IT.items() if k in body.lower()), "Hard")
+            elif is_tour and "AA" in d and d.get("AB") == "1":  # scheduled match
+                rows.append(dict(
+                    match_id=d["AA"], date_timestamp=int(d["AD"]),
+                    tournament=tournament, surface_norm=surface,
+                    is_slam=any(s in tournament.lower() for s in _SLAM_IT),
+                    home_name=d.get("AE", "?"), away_name=d.get("AF", "?"),
+                    home_slug=d.get("WU"), away_slug=d.get("WV"),
+                    url=f"https://www.diretta.it/partita/tennis/{d.get('WU','')}-{d.get('JA','')}/"
+                        f"{d.get('WV','')}-{d.get('JB','')}/?mid={d['AA']}",
+                ))
+    df = pd.DataFrame(rows)
+    if len(df):
+        df["date_human"] = pd.to_datetime(df.date_timestamp, unit="s").dt.strftime("%d %b %Y %H:%M")
+    return df
+
+
+def diretta_odds(match_id: str) -> "tuple[Optional[float], Optional[float], int]":
+    """(median home odds, median away odds, n bookmakers) for match winner,
+    from the public odds-comparison endpoint (same one the match page uses)."""
+    url = (f"https://global.ds.lsapp.eu/odds/pq_graphql?_hash=oce&eventId={match_id}"
+           f"&projectId=400&geoIpCode=IT&geoIpSubdivisionCode=IT-62")
+    try:
+        d = _json.loads(_get(url, _UA))
+        entries = [o for o in d["data"]["findOddsByEventId"]["odds"]
+                   if o.get("bettingType") == "HOME_AWAY" and o.get("bettingScope") == "FULL_TIME"]
+        hs, as_ = [], []
+        for o in entries:
+            v = o.get("odds", [])
+            if len(v) == 2 and v[0].get("value") and v[1].get("value"):
+                hs.append(float(v[0]["value"])); as_.append(float(v[1]["value"]))
+        if not hs:
+            return None, None, 0
+        return _stats.median(hs), _stats.median(as_), len(hs)
+    except Exception:
+        return None, None, 0
+
+
+def upcoming_live(name_index, full_names, last_active, days=(0, 1)) -> pd.DataFrame:
+    """diretta.it schedule + odds, with players resolved to ATP ids (via the
+    feed's full-name slugs, same resolver as fetch_bracket)."""
+    from fetch_bracket import make_resolver
+    df = diretta_daily(days)
+    if df.empty:
+        return df
+    resolve = make_resolver(name_index, full_names, last_active)
+    rev = {v: k for k, v in full_names.items()}
+    for side in ("home", "away"):
+        df[f"{side}_atp_name"] = [resolve(nm, sl) for nm, sl in zip(df[f"{side}_name"], df[f"{side}_slug"])]
+        df[f"{side}_pid"] = df[f"{side}_atp_name"].map(lambda n: rev.get(n))
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(8) as ex:
+        odds = list(ex.map(diretta_odds, df.match_id))
+    df["home_odds_match_winner"] = [o[0] for o in odds]
+    df["away_odds_match_winner"] = [o[1] for o in odds]
+    df["n_bookmakers"] = [o[2] for o in odds]
+    df["round"] = ""
+    return df.sort_values("date_timestamp")

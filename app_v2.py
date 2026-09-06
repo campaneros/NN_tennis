@@ -216,11 +216,23 @@ if action == "Upcoming matches":
     if not s.get("full_names"):   # older snapshot without names: rebuild from whatever source exists
         from fetch_bracket import load_full_names_and_last_active
         _, s["full_names"], s["last_active"] = load_full_names_and_last_active("tennis_atp")
-    from live_data import season_record, upcoming
+    from live_data import season_record, upcoming, upcoming_live
     SEASON = season_record()
-    up = upcoming(s["name_index"], s["full_names"], s["last_active"])
+    src = st.sidebar.radio("Schedule source", ["diretta.it live (today + tomorrow)", "data_updated CSV"])
+    if src.startswith("diretta"):
+        with st.spinner("Fetching today's schedule and bookmaker odds from diretta.it..."):
+            try:
+                up = upcoming_live(s["name_index"], s["full_names"], s["last_active"])
+                if len(up):
+                    st.caption(f"Odds = median across ~{int(up.n_bookmakers.max())} bookmakers "
+                               f"(diretta.it odds-comparison, live).")
+            except Exception as e:
+                st.error(f"diretta.it fetch failed ({e}) — falling back to CSV")
+                up = upcoming(s["name_index"], s["full_names"], s["last_active"])
+    else:
+        up = upcoming(s["name_index"], s["full_names"], s["last_active"])
     if up.empty:
-        st.info("No scheduled ATP Tour matches in data_updated/.")
+        st.info("No scheduled ATP Tour matches found.")
     else:
         tournaments = list(up.tournament.unique())
         sel = st.multiselect("Tournaments", tournaments, default=tournaments)
@@ -231,7 +243,9 @@ if action == "Upcoming matches":
             with st.container(border=True):
                 slam = bool(r.is_slam)
                 bo = 5 if slam else 3
-                head = f"**{r.tournament}** · {r.surface_norm} · Bo{bo}{' · Slam' if slam else ''} · {r.round} · {r.date_human}"
+                head = f"**{r.tournament}** · {r.surface_norm} · Bo{bo}{' · Slam' if slam else ''}{(' · ' + r.round) if r.round else ''} · {r.date_human}"
+                if getattr(r, "url", None):
+                    head += f" · [diretta.it]({r.url})"
                 st.markdown(head)
                 if r.home_pid is None or r.away_pid is None:
                     st.warning(f"{r.home_name} vs {r.away_name}: player not in ATP dataset — no prediction")
@@ -242,21 +256,29 @@ if action == "Upcoming matches":
                 tr = s["tracker"]
                 sn_h = tr.snapshot(int(r.home_pid), r.surface_norm, s["last_date"])
                 sn_a = tr.snapshot(int(r.away_pid), r.surface_norm, s["last_date"])
-                rec_h = SEASON.get(int(r.home_id), (0, 0)); rec_a = SEASON.get(int(r.away_id), (0, 0))
+                _, revmap, _, _ = live_maps()
+                rec_h = SEASON.get(revmap.get(int(r.home_pid)), (0, 0)); rec_a = SEASON.get(revmap.get(int(r.away_pid)), (0, 0))
                 h2h = tr.h2h_diff(int(r.home_pid), int(r.away_pid))
                 c1, c2, c3 = st.columns([3, 2, 3])
                 c1.metric(r.home_atp_name, f"{pr['p1_win_prob']:.0%}", f"±{(hi-lo)/2:.0%} CI", delta_color="off")
-                c1.caption(f"ATP #{int(r.home_rank) if pd.notna(r.home_rank) else '?'} · season {rec_h[0]}-{rec_h[1]} · "
+                rank_h = getattr(r, "home_rank", None); rank_h = int(rank_h) if rank_h == rank_h and rank_h is not None else s["tracker"].bio(int(r.home_pid))["rank"]
+                c1.caption(f"ATP #{int(rank_h) if rank_h == rank_h else '?'} · season {rec_h[0]}-{rec_h[1]} · "
                            f"Elo {sn_h['elo']:.0f} ({r.surface_norm} {sn_h['elo_surf']:.0f}) · "
                            f"last-50 win {sn_h['winrate_recent']:.0%}" if sn_h['winrate_recent'] == sn_h['winrate_recent'] else "")
                 c3.metric(r.away_atp_name, f"{pr['p2_win_prob']:.0%}", f"±{(hi-lo)/2:.0%} CI", delta_color="off")
-                c3.caption(f"ATP #{int(r.away_rank) if pd.notna(r.away_rank) else '?'} · season {rec_a[0]}-{rec_a[1]} · "
+                rank_a = getattr(r, "away_rank", None); rank_a = int(rank_a) if rank_a == rank_a and rank_a is not None else s["tracker"].bio(int(r.away_pid))["rank"]
+                c3.caption(f"ATP #{int(rank_a) if rank_a == rank_a else '?'} · season {rec_a[0]}-{rec_a[1]} · "
                            f"Elo {sn_a['elo']:.0f} ({r.surface_norm} {sn_a['elo_surf']:.0f}) · "
                            f"last-50 win {sn_a['winrate_recent']:.0%}" if sn_a['winrate_recent'] == sn_a['winrate_recent'] else "")
                 if h2h:
                     lead = r.home_atp_name.split()[-1] if h2h > 0 else r.away_atp_name.split()[-1]
                     c2.markdown(f"<div style='text-align:center'>H2H: <b>{lead} +{abs(h2h)}</b></div>",
                                 unsafe_allow_html=True)
+                p_dog = min(pr["p1_win_prob"], pr["p2_win_prob"])
+                dog = r.home_atp_name if pr["p1_win_prob"] < 0.5 else r.away_atp_name
+                lvl = "LOW" if p_dog < 0.20 else ("MEDIUM" if p_dog < 0.35 else "HIGH")
+                c2.markdown(f"<div style='text-align:center'>Risk of upset: <b>{lvl} {p_dog:.0%}</b><br>"
+                            f"<small>underdog: {dog}</small></div>", unsafe_allow_html=True)
                 oh, oa = r.home_odds_match_winner, r.away_odds_match_winner
                 if pd.notna(oh) and pd.notna(oa):
                     c2.markdown(f"<div style='text-align:center'>odds<br><b>{oh:.2f}</b> — <b>{oa:.2f}</b><br>"

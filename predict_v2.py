@@ -251,55 +251,34 @@ def predict_match_prob(pid1: int, pid2: int, surface: str, best_of: int, is_slam
 
 
 def value_bet_analysis(label: str, model_p: float, ci90: "tuple[float, float]", decimal_odds: float) -> str:
-    """Compares the model's probability (and its 90% MC-dropout interval)
-    against a bookmaker's decimal odds, and states whether the edge is
-    robust enough to act on.
-
-    Kelly criterion (Kelly, 1956; standard in sports-betting bankroll
-    management): for decimal odds `o` and true win probability `p`, the
-    growth-optimal stake fraction of bankroll is
-        f* = (p*o - 1) / (o - 1)
-    We report a QUARTER-Kelly stake (f*/4) rather than full Kelly — a
-    standard practitioner haircut (Thorp) because f* assumes `p` is known
-    exactly, whereas here it's a model estimate with its own uncertainty
-    (the 90% CI); betting full Kelly on an uncertain edge risks large
-    drawdowns if the model is optimistic.
-
-    The recommendation itself uses the CI, not just the point estimate:
-    - VALUE BET: even the pessimistic (CI lower-bound) probability still
-      implies positive expected value at these odds — the edge survives
-      the model's own uncertainty about itself.
-    - MARGINAL: the point estimate has positive edge, but the CI lower
-      bound does not — a less confident, discretionary edge.
-    - NO BET: the point estimate itself is below the break-even (implied)
-      probability — negative expected value even optimistically.
-    """
+    """Single-bet framing: what you win/lose on THIS one bet, how likely each
+    outcome is, how wrong the model could plausibly be (its 90% CI), and
+    whether the OFFERED price overpays or underpays that risk (fair odds =
+    1/p). A positive verdict never means "you will win": it means the price
+    is better than the risk — you still lose (1-p) of the time."""
     implied_p = 1.0 / decimal_odds
-    edge = model_p - implied_p
-    ev_per_unit = model_p * decimal_odds - 1.0
     lo, hi = ci90
-    kelly_full = max(0.0, (model_p * decimal_odds - 1.0) / (decimal_odds - 1.0))
-    kelly_quarter = kelly_full / 4.0
-
+    fair = 1.0 / model_p if model_p > 0 else float("inf")
+    win_amt = 100 * (decimal_odds - 1)
     lines = [
-        f"\n  --- Value bet check: {label} @ decimal odds {decimal_odds:.2f} ---",
-        f"  Implied probability (market):  {implied_p:.3f}",
-        f"  Model probability (point):     {model_p:.3f}   (90% CI: {lo:.3f}-{hi:.3f})",
-        f"  Edge (model - implied):        {edge:+.3f}",
-        f"  Expected value per 1 staked:   {ev_per_unit:+.3f}",
+        f"\n  --- Single bet: 100 on {label} @ {decimal_odds:.2f} ---",
+        f"  This one bet: WIN +{win_amt:.0f} with probability {model_p:.0%} | LOSE -100 with probability {1-model_p:.0%}",
+        f"  How wrong could the model be: win probability between {lo:.0%} and {hi:.0%} (90% interval)",
+        f"  Fair odds for this risk: {fair:.2f} — offered {decimal_odds:.2f} "
+        f"({'the book overpays you' if decimal_odds > fair else 'the book underpays you'})",
     ]
     if lo > implied_p:
-        lines.append(f"  => VALUE BET: even in the pessimistic case the true probability still beats "
-                      f"the break-even {implied_p:.3f}. Per 100 staked: win +{100*(decimal_odds-1):.0f} "
-                      f"(P={model_p:.2f}) / lose -100 (P={1-model_p:.2f}) → {ev_per_unit*100:+.1f} on average.")
+        lines.append(f"  => VALUE BET: the price overpays the risk even in the model's pessimistic case "
+                      f"(worst-case P {lo:.0%} still above the {implied_p:.0%} the price charges). "
+                      f"You can still lose this single bet ({1-model_p:.0%} chance) — the price is right, "
+                      f"the outcome is not guaranteed.")
     elif model_p > implied_p:
-        lines.append(f"  => MARGINAL: positive on average, but in the pessimistic case "
-                      f"(P={lo:.3f}) you'd be below break-even ({implied_p:.3f}) — the model isn't "
-                      f"sure enough. Per 100 staked: {ev_per_unit*100:+.1f} on average, but could be "
-                      f"{(lo*decimal_odds-1)*100:+.1f}. Bet small or skip.")
+        lines.append(f"  => MARGINAL: at the model's central estimate the price slightly overpays the risk, "
+                      f"but if the model is at the pessimistic end ({lo:.0%}) you're being underpaid. "
+                      f"The edge is smaller than the model's own uncertainty — skip, or bet small.")
     else:
-        lines.append(f"  => NO BET: you need P > {implied_p:.3f} to break even at these odds, the "
-                      f"model says {model_p:.3f} — you lose {-ev_per_unit*100:.1f} per 100 on average.")
+        lines.append(f"  => NO BET: the price underpays the risk — you'd risk 100 to win {win_amt:.0f} "
+                      f"on a {model_p:.0%} chance, and that trade is priced against you.")
     return "\n".join(lines)
 
 
@@ -353,14 +332,12 @@ def staking_plan(n1: str, n2: str, p1: float, ci1, o1: float, o2: float,
                    f"stake {w1:.1%} on {n1} / {w2:.1%} on {n2} for a risk-free "
                    f"{1 / overround - 1:+.2%} return, model-independent.")
         return "\n".join(out)
-    # Risk/reward per side, in the terms a bettor thinks in: per 100 staked,
-    # what you win, what you lose, how often, and the break-even probability
-    # 1/odds you must beat. Kelly's stake is derived from exactly these
-    # (f* = edge / (odds-1): small payoff => small stake even at high p).
+    # Single-bet framing per side: what this one bet wins or loses, the
+    # probability of each, and the fair odds for that risk vs the offered odds.
     for name, p_side, ci_lo, odds in ((n1, p1, lo, o1), (n2, p2, 1 - hi, o2)):
-        ev100 = 100 * (p_side * odds - 1)
-        out.append(f"  {name:<22} per 100 staked: win +{100*(odds-1):.0f} (P={p_side:.3f}) / lose -100 "
-                   f"(P={1-p_side:.3f}) | break-even P={1/odds:.3f} | EV {ev100:+.1f}")
+        fair = 1.0 / p_side if p_side > 0 else float("inf")
+        out.append(f"  {name:<22} bet 100: win +{100*(odds-1):.0f} ({p_side:.0%}) / lose -100 ({1-p_side:.0%}) "
+                   f"| fair odds {fair:.2f} vs offered {odds:.2f}")
     if f1 == 0 and f2 == 0:
         out.append(f"  => NO BET: neither side beats its break-even probability.")
         return "\n".join(out)
@@ -368,8 +345,9 @@ def staking_plan(n1: str, n2: str, p1: float, ci1, o1: float, o2: float,
         if f == 0:
             continue
         robust = ci_lo > 1 / odds
-        out.append(f"  => BET on {name} @ {odds:.2f}: {100*(p_side*odds-1):+.1f} per 100 on average "
-                   f"— {'robust: still positive in the pessimistic case' if robust else f'MARGINAL: could be {100*(ci_lo*odds-1):+.1f} per 100 in the pessimistic case'}")
+        out.append(f"  => BET on {name} @ {odds:.2f}: the offered price beats the fair price for the risk "
+                   f"— {'even in the pessimistic case' if robust else 'but NOT in the pessimistic case (MARGINAL)'}. "
+                   f"You still lose this single bet {1-p_side:.0%} of the time.")
     return "\n".join(out)
 
 
