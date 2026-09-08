@@ -201,6 +201,63 @@ def stats_and_h2h_panel(pid_h, pid_a, nm_h, nm_a, s, surface):
             st.dataframe(t.set_index("date"), use_container_width=True)
 
 
+def render_match_report(nm1, nm2, pr, o1, o2, s, surface, best_of, slam):
+    """Everything the Predict tab shows for one match (except news): win-prob
+    bar chart with CI, summary line, single-bet analysis for BOTH sides, and
+    the which-side staking verdict. Reused by the Upcoming cards."""
+    from predict_v2 import staking_plan, value_bet_analysis
+    lo, hi = pr["p1_win_ci90"]
+    # ── tennisdata-style headline blocks: WHO WINS first, betting later ──
+    p_fav = max(pr["p1_win_prob"], pr["p2_win_prob"])
+    fav, dog = (nm1, nm2) if pr["p1_win_prob"] >= 0.5 else (nm2, nm1)
+    conf = "Strong" if p_fav >= 0.70 else ("Moderate" if p_fav >= 0.60 else "Slight")
+    p_dog = 1 - p_fav
+    risk = "LOW" if p_dog < 0.20 else ("MEDIUM" if p_dog < 0.35 else "HIGH")
+    cw, cr = st.columns(2)
+    with cw:
+        st.markdown(f"##### MATCH WINNER")
+        st.markdown(f"## {p_fav:.0%} — {fav}")
+        (st.success if conf == "Strong" else st.info)(f"{conf} confidence (90% CI ±{(hi-lo)/2:.0%})")
+    with cr:
+        st.markdown(f"##### RISK OF UPSET")
+        st.markdown(f"## {risk}: {p_dog:.0%}")
+        st.progress(min(1.0, p_dog / 0.5))
+        st.caption(f"underdog: {dog}")
+    fig, ax = plt.subplots(figsize=(6, 3))
+    ax.bar([nm1, nm2], [pr["p1_win_prob"], pr["p2_win_prob"]],
+           yerr=[[pr["p1_win_prob"] - lo, hi - pr["p1_win_prob"]],
+                 [hi - pr["p1_win_prob"], pr["p1_win_prob"] - lo]],
+           capsize=8, color=["tab:blue", "tab:orange"])
+    ax.axhline(0.5, ls="--", c="gray", lw=0.8)
+    ax.set_ylim(0, 1); ax.set_ylabel("P(win)  ±90% CI")
+    ax.set_title(f"{surface} · Bo{best_of}{' · Slam' if slam else ''}")
+    st.pyplot(fig); plt.close(fig)
+    st.write(f"**P({nm1}) = {pr['p1_win_prob']:.3f}** [{lo:.3f}–{hi:.3f}] · "
+             f"**P({nm2}) = {pr['p2_win_prob']:.3f}** · Elo {pr['p1_elo']:.0f} vs {pr['p2_elo']:.0f}")
+    if (o1 and o1 > 1) or (o2 and o2 > 1):
+        from predict_v2 import single_bet_verdict
+        st.markdown("##### Should YOU bet this single match?")
+        for name, pp, ci, odds in ((nm1, pr["p1_win_prob"], (lo, hi), o1),
+                                   (nm2, pr["p2_win_prob"], (1 - hi, 1 - lo), o2)):
+            if odds and odds > 1:
+                v, why = single_bet_verdict(name, pp, ci, odds)
+                {"GOOD BET": st.success, "RISKY": st.warning}.get(v, st.error)(
+                    f"{name} @ {odds:.2f}: **{v}** — {'; '.join(why)}")
+        st.markdown("##### Betting value (price check — NOT a prediction of who wins)")
+        st.caption("A VALUE verdict on the underdog means the PRICE overpays the risk, "
+                   "not that they are likely to win: you still lose that bet most of the time.")
+    for name, p, ci, odds in ((nm1, pr["p1_win_prob"], (lo, hi), o1),
+                              (nm2, pr["p2_win_prob"], (1 - hi, 1 - lo), o2)):
+        if odds and odds > 1:
+            tag = "" if p >= 0.5 else f" (underdog — wins only {p:.0%} of the time)"
+            verdict_box(value_bet_analysis(name, p, ci, odds), f"{name} @ {odds:.2f}{tag}")
+    if o1 and o2 and o1 > 1 and o2 > 1:
+        plan = staking_plan(nm1, nm2, pr["p1_win_prob"], (lo, hi), o1, o2)
+        (st.success if "BET" in plan and "NO BET" not in plan else st.info)(
+            "\n".join(l.strip() for l in plan.splitlines() if l.strip().startswith(("=>", "ARB"))))
+        st.code(plan)
+
+
 def verdict_box(txt, label):
     verdict = txt.split("=> ")[-1].split(":")[0]
     {"VALUE BET": st.success, "MARGINAL": st.warning}.get(verdict, st.error)(f"{label}: **{verdict}**")
@@ -283,14 +340,17 @@ if action == "Upcoming matches":
                 if pd.notna(oh) and pd.notna(oa):
                     c2.markdown(f"<div style='text-align:center'>odds<br><b>{oh:.2f}</b> — <b>{oa:.2f}</b><br>"
                                 f"implied {1/oh:.0%} — {1/oa:.0%}</div>", unsafe_allow_html=True)
+                    from predict_v2 import single_bet_verdict
                     for nm, p, ci, od in ((r.home_atp_name, pr["p1_win_prob"], (lo, hi), oh),
                                           (r.away_atp_name, pr["p2_win_prob"], (1-hi, 1-lo), oa)):
-                        txt = value_bet_analysis(nm, p, ci, float(od))
-                        verdict = txt.split("=> ")[-1].split(":")[0]
-                        if verdict != "NO BET":
-                            {"VALUE BET": st.success, "MARGINAL": st.warning}[verdict](f"{nm} @ {od:.2f}: **{verdict}**")
-                            with st.expander("details"):
-                                st.code(txt)
+                        v, why = single_bet_verdict(nm, p, ci, float(od))
+                        if v != "BAD BET":
+                            {"GOOD BET": st.success, "RISKY": st.warning}[v](
+                                f"{nm} @ {od:.2f}: **{v}** — {'; '.join(why)}")
+                with st.expander("Full analysis (chart, single-bet breakdown, which side)"):
+                    render_match_report(r.home_atp_name, r.away_atp_name, pr,
+                                        float(oh) if pd.notna(oh) else None, float(oa) if pd.notna(oa) else None,
+                                        s, r.surface_norm, bo, slam)
                 with st.expander("Player stats & head-to-head"):
                     stats_and_h2h_panel(int(r.home_pid), int(r.away_pid), r.home_atp_name, r.away_atp_name, s, r.surface_norm)
 
@@ -315,20 +375,7 @@ elif action == "Predict match":
         pid1, pid2 = resolve_player(p1, s["name_index"]), resolve_player(p2, s["name_index"])
         r = predict_match_prob(pid1, pid2, surface, best_of, slam, "tennis_atp", out_dir, n_mc)
         lo, hi = r["p1_win_ci90"]
-        fig, ax = plt.subplots(figsize=(6, 3))
-        ax.bar([p1, p2], [r["p1_win_prob"], r["p2_win_prob"]],
-               yerr=[[r["p1_win_prob"] - lo, hi - r["p1_win_prob"]], [hi - r["p1_win_prob"], r["p1_win_prob"] - lo]],
-               capsize=8, color=["tab:blue", "tab:orange"])
-        ax.axhline(0.5, ls="--", c="gray", lw=0.8)
-        ax.set_ylim(0, 1); ax.set_ylabel("P(win)  ±90% CI")
-        ax.set_title(f"{surface} · Bo{best_of}{' · Slam' if slam else ''}")
-        st.pyplot(fig)
-        st.write(f"**P({p1}) = {r['p1_win_prob']:.3f}** [{lo:.3f}–{hi:.3f}] · "
-                 f"**P({p2}) = {r['p2_win_prob']:.3f}** · Elo {r['p1_elo']:.0f} vs {r['p2_elo']:.0f}")
-        for name, p, ci, odds in ((p1, r["p1_win_prob"], (lo, hi), o1),
-                                  (p2, r["p2_win_prob"], (1 - hi, 1 - lo), o2)):
-            if odds > 1:
-                verdict_box(value_bet_analysis(name, p, ci, odds), f"{name} @ {odds:.2f}")
+        render_match_report(p1, p2, r, o1, o2, s, surface, best_of, slam)
         if news:
             from news_v2 import fetch_news
             for name in (p1, p2):
@@ -339,11 +386,6 @@ elif action == "Predict match":
                     if not items:
                         st.caption("no matching headlines")
             st.caption("Headlines are context the model does NOT see — weigh them before staking.")
-        if o1 > 1 and o2 > 1:
-            plan = staking_plan(p1, p2, r["p1_win_prob"], (lo, hi), o1, o2)
-            (st.success if "BET" in plan and "NO BET" not in plan else st.info)(
-                "\n".join(l.strip() for l in plan.splitlines() if l.strip().startswith(("=>", "ARB"))))
-            st.code(plan)
         if HAS_LIVE:
             with st.expander("Player stats & head-to-head", expanded=True):
                 stats_and_h2h_panel(pid1, pid2, p1, p2, s, surface)

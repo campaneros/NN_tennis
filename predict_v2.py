@@ -282,6 +282,43 @@ def value_bet_analysis(label: str, model_p: float, ci90: "tuple[float, float]", 
     return "\n".join(lines)
 
 
+# Single-bet quality thresholds (tunable): a bet is judged on THIS event,
+# not on a long-run average — see single_bet_verdict.
+MIN_WIN_PROB = 0.55    # must be more likely to win than lose, with margin
+MIN_PAYOFF = 0.40      # must win at least 40 per 100 risked (odds >= 1.40)
+
+
+def single_bet_verdict(name: str, model_p: float, ci90, decimal_odds: float):
+    """Judge ONE bet the way a person betting once should: (1) will I
+    probably win it? (2) does it pay enough for what I risk? (3) is the
+    price better than fair? Returns (verdict, [reasons]).
+      GOOD BET  — all three hold, edge robust to the model's own CI.
+      RISKY     — wins more often than not and price is fair-or-better,
+                  but at least one criterion is weak.
+      BAD BET   — likely to lose, or pays too little, or priced against you."""
+    lo, hi = ci90
+    implied = 1.0 / decimal_odds
+    payoff = decimal_odds - 1.0
+    reasons = []
+    if model_p < 0.5:
+        reasons.append(f"you lose this bet {1-model_p:.0%} of the time")
+    elif model_p < MIN_WIN_PROB:
+        reasons.append(f"barely favored ({model_p:.0%})")
+    if payoff < MIN_PAYOFF:
+        reasons.append(f"pays too little for the risk: win +{100*payoff:.0f} vs lose -100")
+    if model_p <= implied:
+        reasons.append(f"price below fair (needs {implied:.0%}, model says {model_p:.0%})")
+    elif lo <= implied:
+        reasons.append(f"edge not robust: pessimistic case {lo:.0%} is under break-even {implied:.0%}")
+    hard_fail = model_p < 0.5 or payoff < MIN_PAYOFF or model_p <= implied
+    if not reasons:
+        return "GOOD BET", [f"likely win ({model_p:.0%}), pays +{100*payoff:.0f} per 100, "
+                             f"price above fair even in the pessimistic case"]
+    if hard_fail:
+        return "BAD BET", reasons
+    return "RISKY", reasons
+
+
 def optimal_allocation(p1: float, p2_prob: float, o1: float, o2: float, kelly_fraction: float = 0.25):
     """Growth-optimal stake split across BOTH sides of a 2-outcome market.
 
